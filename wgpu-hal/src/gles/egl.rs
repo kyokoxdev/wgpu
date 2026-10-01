@@ -23,10 +23,10 @@ const EGL_PLATFORM_SURFACELESS_MESA: u32 = 0x31DD;
 const EGL_GL_COLORSPACE_KHR: u32 = 0x309D;
 const EGL_GL_COLORSPACE_SRGB_KHR: u32 = 0x3089;
 
-#[cfg(not(Emscripten))]
+#[cfg(not(any(Emscripten, target_os = "horizon")))]
 type EglInstance = khronos_egl::DynamicInstance<khronos_egl::EGL1_4>;
 
-#[cfg(Emscripten)]
+#[cfg(any(Emscripten, target_os = "horizon"))]
 type EglInstance = khronos_egl::Instance<khronos_egl::Static>;
 
 type EglLabel = *const ffi::c_void;
@@ -717,11 +717,11 @@ impl crate::Instance for Instance {
         use raw_window_handle::RawDisplayHandle as Rdh;
 
         profiling::scope!("Init OpenGL (EGL) Backend");
-        #[cfg(Emscripten)]
+        #[cfg(any(Emscripten, target_os = "horizon"))]
         let egl_result: Result<EglInstance, khronos_egl::Error> =
             Ok(khronos_egl::Instance::new(khronos_egl::Static));
 
-        #[cfg(not(Emscripten))]
+        #[cfg(not(any(Emscripten, target_os = "horizon")))]
         let egl_result = if cfg!(windows) {
             unsafe {
                 khronos_egl::DynamicInstance::<khronos_egl::EGL1_4>::load_required_from_filename(
@@ -752,10 +752,10 @@ impl crate::Instance for Instance {
             client_ext_str.split_whitespace().collect::<Vec<_>>()
         );
 
-        #[cfg(not(Emscripten))]
+        #[cfg(not(any(Emscripten, target_os = "horizon")))]
         let egl1_5 = egl.upcast::<khronos_egl::EGL1_5>();
 
-        #[cfg(Emscripten)]
+        #[cfg(any(Emscripten, target_os = "horizon"))]
         let egl1_5: Option<&Arc<EglInstance>> = Some(&egl);
 
         let (display, wsi_kind) = match (desc.display.map(|d| d.as_raw()), egl1_5) {
@@ -953,6 +953,9 @@ impl crate::Instance for Instance {
                     )));
                 }
             }
+            // Horizon's NWindow* travels in the AndroidNdk handle; EGL takes it as-is.
+            #[cfg(target_os = "horizon")]
+            (Rwh::AndroidNdk(_), _) => {}
             (Rwh::Wayland(_), _) => {}
             #[cfg(Emscripten)]
             (Rwh::Web(_), _) => {}
@@ -1323,10 +1326,10 @@ impl crate::Surface for Surface {
                 }
                 attributes.push(khronos_egl::ATTRIB_NONE as i32);
 
-                #[cfg(not(Emscripten))]
+                #[cfg(not(any(Emscripten, target_os = "horizon")))]
                 let egl1_5 = self.egl.instance.upcast::<khronos_egl::EGL1_5>();
 
-                #[cfg(Emscripten)]
+                #[cfg(any(Emscripten, target_os = "horizon"))]
                 let egl1_5: Option<&Arc<EglInstance>> = Some(&self.egl.instance);
 
                 // Careful, we can still be in 1.4 version even if `upcast` succeeds
