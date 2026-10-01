@@ -22,7 +22,8 @@ fn main() {
             )
         ) },
         metal: { all(target_vendor = "apple", feature = "metal") },
-        vulkan: { all(not(target_arch = "wasm32"), feature = "vulkan") },
+        // Horizon has no Vulkan loader; only the GL ES backend applies there.
+        vulkan: { all(not(target_arch = "wasm32"), not(target_os = "horizon"), feature = "vulkan") },
         drm: { all(
             feature = "drm",
             any(target_os = "linux", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd")
