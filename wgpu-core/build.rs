@@ -17,7 +17,7 @@ fn main() {
             all(target_vendor = "apple", feature = "angle") // ANGLE on Apple
         ) },
         vulkan: { any(
-            all(windows_linux_android, feature = "vulkan"), // Regular Vulkan
+            all(windows_linux_android, not(target_os = "horizon"), feature = "vulkan"), // Regular Vulkan
             all(target_vendor = "apple", feature = "vulkan-portability") // Vulkan Portability on Apple
         ) },
         metal: { all(target_vendor = "apple", feature = "metal") },

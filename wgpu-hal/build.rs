@@ -22,7 +22,8 @@ fn main() {
             )
         ) },
         metal: { all(target_vendor = "apple", feature = "metal") },
-        vulkan: { all(not(target_arch = "wasm32"), feature = "vulkan") },
+        // Horizon has no Vulkan loader; only the GL ES backend applies there.
+        vulkan: { all(not(target_arch = "wasm32"), not(target_os = "horizon"), feature = "vulkan") },
         any_backend: { any(dx12, metal, vulkan, gles) },
         // ⚠️ Keep in sync with target.cfg() definition in Cargo.toml and cfg_alias in `wgpu` crate ⚠️
         static_dxc: { all(target_os = "windows", feature = "static-dxc", not(target_arch = "aarch64"), target_env = "msvc") },
