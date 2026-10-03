@@ -976,6 +976,7 @@ impl crate::Instance for Instance {
             raw_window_handle: window_handle,
             swapchain: RwLock::new(None),
             srgb_kind: inner.srgb_kind,
+            srgb_present_program: Mutex::new(None),
         })
     }
 
@@ -1078,13 +1079,21 @@ pub struct Swapchain {
     surface: khronos_egl::Surface,
     wl_window: Option<*mut wayland_sys::egl::wl_egl_window>,
     framebuffer: glow::Framebuffer,
-    renderbuffer: glow::Renderbuffer,
+    storage: SwapchainStorage,
     /// Extent because the window lies
     extent: wgt::Extent3d,
     format: wgt::TextureFormat,
     format_desc: super::TextureFormatDesc,
     #[allow(unused)]
     sample_type: wgt::TextureSampleType,
+}
+
+/// `Texture` backs an sRGB swapchain on a surface without EGL sRGB support;
+/// `present` encodes it with a shader instead of blitting.
+#[derive(Debug, Clone, Copy)]
+enum SwapchainStorage {
+    Renderbuffer(glow::Renderbuffer),
+    Texture(glow::Texture),
 }
 
 #[derive(Debug)]
@@ -1096,6 +1105,7 @@ pub struct Surface {
     raw_window_handle: raw_window_handle::RawWindowHandle,
     swapchain: RwLock<Option<Swapchain>>,
     srgb_kind: SrgbFrameBufferKind,
+    srgb_present_program: Mutex<Option<glow::Program>>,
 }
 
 unsafe impl Send for Surface {}
@@ -1130,6 +1140,25 @@ impl Surface {
         unsafe { gl.color_mask(true, true, true, true) };
 
         unsafe { gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None) };
+
+        if let SwapchainStorage::Texture(texture) = sc.storage {
+            unsafe {
+                gl.viewport(0, 0, sc.extent.width as i32, sc.extent.height as i32);
+                gl.bind_sampler(0, None);
+                gl.active_texture(glow::TEXTURE0);
+                gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+                gl.use_program(*self.srgb_present_program.lock());
+                gl.disable(glow::DEPTH_TEST);
+                gl.disable(glow::STENCIL_TEST);
+                gl.disable(glow::BLEND);
+                gl.disable(glow::CULL_FACE);
+                gl.draw_buffers(&[glow::BACK]);
+                gl.draw_arrays(glow::TRIANGLES, 0, 3);
+                gl.bind_texture(glow::TEXTURE_2D, None);
+            }
+            return unsafe { self.swap_and_release(sc) };
+        }
+
         unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(sc.framebuffer)) };
 
         if !matches!(self.srgb_kind, SrgbFrameBufferKind::None) {
@@ -1162,6 +1191,10 @@ impl Surface {
 
         unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None) };
 
+        unsafe { self.swap_and_release(sc) }
+    }
+
+    unsafe fn swap_and_release(&self, sc: &Swapchain) -> Result<(), crate::SurfaceError> {
         self.egl
             .instance
             .swap_buffers(self.egl.display, sc.surface)
@@ -1191,7 +1224,10 @@ impl Surface {
         let gl = &device.shared.context.lock();
         match self.swapchain.write().take() {
             Some(sc) => {
-                unsafe { gl.delete_renderbuffer(sc.renderbuffer) };
+                match sc.storage {
+                    SwapchainStorage::Renderbuffer(rb) => unsafe { gl.delete_renderbuffer(rb) },
+                    SwapchainStorage::Texture(t) => unsafe { gl.delete_texture(t) },
+                }
                 unsafe { gl.delete_framebuffer(sc.framebuffer) };
                 Some((sc.surface, sc.wl_window))
             }
@@ -1200,10 +1236,36 @@ impl Surface {
     }
 
     pub fn supports_srgb(&self) -> bool {
-        match self.srgb_kind {
-            SrgbFrameBufferKind::None => false,
-            _ => true,
+        // Horizon: `SwapchainStorage::Texture` encodes sRGB in `present`.
+        cfg!(target_os = "horizon") || !matches!(self.srgb_kind, SrgbFrameBufferKind::None)
+    }
+
+    unsafe fn create_srgb_present_program(gl: &glow::Context) -> Result<glow::Program, String> {
+        let program = unsafe { gl.create_program() }?;
+        for (stage, source) in [
+            (
+                glow::VERTEX_SHADER,
+                include_str!("./shaders/srgb_present.vert"),
+            ),
+            (
+                glow::FRAGMENT_SHADER,
+                include_str!("./shaders/srgb_present.frag"),
+            ),
+        ] {
+            let shader = unsafe { gl.create_shader(stage) }?;
+            unsafe { gl.shader_source(shader, source) };
+            unsafe { gl.compile_shader(shader) };
+            if !unsafe { gl.get_shader_compile_status(shader) } {
+                return Err(unsafe { gl.get_shader_info_log(shader) });
+            }
+            unsafe { gl.attach_shader(program, shader) };
+            unsafe { gl.delete_shader(shader) };
         }
+        unsafe { gl.link_program(program) };
+        if !unsafe { gl.get_program_link_status(program) } {
+            return Err(unsafe { gl.get_program_info_log(program) });
+        }
+        Ok(program)
     }
 }
 
@@ -1370,41 +1432,79 @@ impl crate::Surface for Surface {
 
         let format_desc = device.shared.describe_texture_format(config.format);
         let gl = &device.shared.context.lock();
-        let renderbuffer = unsafe { gl.create_renderbuffer() }.map_err(|error| {
-            log::error!("Internal swapchain renderbuffer creation failed: {error}");
-            crate::DeviceError::OutOfMemory
-        })?;
-        unsafe { gl.bind_renderbuffer(glow::RENDERBUFFER, Some(renderbuffer)) };
-        unsafe {
-            gl.renderbuffer_storage(
-                glow::RENDERBUFFER,
-                format_desc.internal,
-                config.extent.width as _,
-                config.extent.height as _,
-            )
-        };
         let framebuffer = unsafe { gl.create_framebuffer() }.map_err(|error| {
             log::error!("Internal swapchain framebuffer creation failed: {error}");
             crate::DeviceError::OutOfMemory
         })?;
         unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(framebuffer)) };
-        unsafe {
-            gl.framebuffer_renderbuffer(
-                glow::READ_FRAMEBUFFER,
-                glow::COLOR_ATTACHMENT0,
-                glow::RENDERBUFFER,
-                Some(renderbuffer),
-            )
-        };
-        unsafe { gl.bind_renderbuffer(glow::RENDERBUFFER, None) };
+        let storage =
+            if config.format.is_srgb() && matches!(self.srgb_kind, SrgbFrameBufferKind::None) {
+                let mut program = self.srgb_present_program.lock();
+                if program.is_none() {
+                    *program = Some(unsafe { Self::create_srgb_present_program(gl) }.map_err(
+                        |error| {
+                            log::error!("sRGB present program failed: {error}");
+                            crate::SurfaceError::Other("sRGB present program")
+                        },
+                    )?);
+                }
+                let texture = unsafe { gl.create_texture() }.map_err(|error| {
+                    log::error!("Internal swapchain texture creation failed: {error}");
+                    crate::DeviceError::OutOfMemory
+                })?;
+                unsafe {
+                    gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+                    for filter in [glow::TEXTURE_MIN_FILTER, glow::TEXTURE_MAG_FILTER] {
+                        gl.tex_parameter_i32(glow::TEXTURE_2D, filter, glow::NEAREST as _);
+                    }
+                    gl.tex_storage_2d(
+                        glow::TEXTURE_2D,
+                        1,
+                        format_desc.internal,
+                        config.extent.width as _,
+                        config.extent.height as _,
+                    );
+                    gl.framebuffer_texture_2d(
+                        glow::READ_FRAMEBUFFER,
+                        glow::COLOR_ATTACHMENT0,
+                        glow::TEXTURE_2D,
+                        Some(texture),
+                        0,
+                    );
+                    gl.bind_texture(glow::TEXTURE_2D, None);
+                }
+                SwapchainStorage::Texture(texture)
+            } else {
+                let renderbuffer = unsafe { gl.create_renderbuffer() }.map_err(|error| {
+                    log::error!("Internal swapchain renderbuffer creation failed: {error}");
+                    crate::DeviceError::OutOfMemory
+                })?;
+                unsafe {
+                    gl.bind_renderbuffer(glow::RENDERBUFFER, Some(renderbuffer));
+                    gl.renderbuffer_storage(
+                        glow::RENDERBUFFER,
+                        format_desc.internal,
+                        config.extent.width as _,
+                        config.extent.height as _,
+                    );
+                    gl.framebuffer_renderbuffer(
+                        glow::READ_FRAMEBUFFER,
+                        glow::COLOR_ATTACHMENT0,
+                        glow::RENDERBUFFER,
+                        Some(renderbuffer),
+                    );
+                    gl.bind_renderbuffer(glow::RENDERBUFFER, None);
+                }
+                SwapchainStorage::Renderbuffer(renderbuffer)
+            };
         unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None) };
 
         let mut swapchain = self.swapchain.write();
         *swapchain = Some(Swapchain {
             surface,
             wl_window,
-            renderbuffer,
             framebuffer,
+            storage,
             extent: config.extent,
             format: config.format,
             format_desc,
@@ -1440,8 +1540,12 @@ impl crate::Surface for Surface {
             "Surface has no swap-chain configured",
         ))?;
         let texture = super::Texture {
-            inner: super::TextureInner::Renderbuffer {
-                raw: sc.renderbuffer,
+            inner: match sc.storage {
+                SwapchainStorage::Renderbuffer(raw) => super::TextureInner::Renderbuffer { raw },
+                SwapchainStorage::Texture(raw) => super::TextureInner::Texture {
+                    raw,
+                    target: glow::TEXTURE_2D,
+                },
             },
             drop_guard: None,
             array_layer_count: 1,
