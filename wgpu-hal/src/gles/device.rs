@@ -444,6 +444,13 @@ impl super::Device {
         unsafe { gl.link_program(program) };
 
         for shader in shaders_to_delete {
+            // A deleted shader lives while attached, and Mesa keeps its source
+            // and GLSL IR for a relink; detached, it is freed now. On Horizon
+            // that heap also backs the GPU.
+            #[cfg(target_os = "horizon")]
+            unsafe {
+                gl.detach_shader(program, shader)
+            };
             unsafe { gl.delete_shader(shader) };
         }
 
