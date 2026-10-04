@@ -1607,6 +1607,14 @@ impl Device {
             }
             hal_view_formats.push(*format);
         }
+        // Horizon (switch-mesa GL) cannot reinterpret a texture's format. Accept
+        // the sRGB-twin request anyway, so callers that never create the other
+        // view (Bevy's main textures) work; such a view would draw as the base
+        // format.
+        #[cfg(target_os = "horizon")]
+        if !self.downlevel.flags.contains(wgt::DownlevelFlags::VIEW_FORMATS) {
+            hal_view_formats.clear();
+        }
         if !hal_view_formats.is_empty() {
             self.require_downlevel_flags(wgt::DownlevelFlags::VIEW_FORMATS)?;
         }
