@@ -1457,10 +1457,13 @@ impl crate::Surface for Surface {
                     for filter in [glow::TEXTURE_MIN_FILTER, glow::TEXTURE_MAG_FILTER] {
                         gl.tex_parameter_i32(glow::TEXTURE_2D, filter, glow::NEAREST as _);
                     }
+                    // Linear storage, not SRGB8_ALPHA8: with FRAMEBUFFER_SRGB
+                    // off, writes land unencoded, and sampling an sRGB texture
+                    // in `present` would decode them a second time.
                     gl.tex_storage_2d(
                         glow::TEXTURE_2D,
                         1,
-                        format_desc.internal,
+                        glow::RGBA8,
                         config.extent.width as _,
                         config.extent.height as _,
                     );
