@@ -1229,6 +1229,10 @@ impl Surface {
                     SwapchainStorage::Texture(t) => unsafe { gl.delete_texture(t) },
                 }
                 unsafe { gl.delete_framebuffer(sc.framebuffer) };
+                // Recreated lazily by the next `configure` that needs it.
+                if let Some(program) = self.srgb_present_program.lock().take() {
+                    unsafe { gl.delete_program(program) };
+                }
                 Some((sc.surface, sc.wl_window))
             }
             None => None,

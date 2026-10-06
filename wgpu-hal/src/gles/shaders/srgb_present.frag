@@ -1,5 +1,5 @@
 #version 300 es
-precision mediump float;
+precision highp float;
 in vec2 uv;
 uniform sampler2D present_texture;
 out vec4 frag;
