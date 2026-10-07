@@ -5,6 +5,14 @@ use arrayvec::ArrayVec;
 
 use super::{conv, Command as C};
 
+#[derive(Clone, Debug, PartialEq)]
+struct BoundTexture {
+    raw: glow::Texture,
+    target: super::BindTarget,
+    aspects: crate::FormatAspects,
+    mip_levels: Range<u32>,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct TextureSlotDesc {
     tex_target: super::BindTarget,
@@ -25,6 +33,14 @@ pub(super) struct State {
     alpha_to_coverage_enabled: bool,
     samplers: [Option<glow::Sampler>; super::MAX_SAMPLERS],
     texture_slots: [TextureSlotDesc; super::MAX_TEXTURE_SLOTS],
+    /// What each unit's last `BindTexture` in this pass bound, to skip
+    /// re-binding it: each one is a bind plus two `tex_parameter` calls, and
+    /// a draw re-sends its whole bind group. Reset per pass: copies between
+    /// passes bind textures on the active unit.
+    bound_textures: [Option<BoundTexture>; super::MAX_TEXTURE_SLOTS],
+    /// Each unit's last `BindSampler` in this encoder. Nothing else in replay
+    /// changes sampler bindings, so it holds across passes.
+    bound_samplers: [Option<Option<glow::Sampler>>; super::MAX_TEXTURE_SLOTS],
     render_size: wgt::Extent3d,
     resolve_attachments: ArrayVec<(u32, super::TextureView), { crate::MAX_COLOR_ATTACHMENTS }>,
     invalidate_attachments: ArrayVec<u32, { crate::MAX_COLOR_ATTACHMENTS + 2 }>,
@@ -55,6 +71,8 @@ impl Default for State {
             alpha_to_coverage_enabled: Default::default(),
             samplers: Default::default(),
             texture_slots: Default::default(),
+            bound_textures: Default::default(),
+            bound_samplers: Default::default(),
             render_size: Default::default(),
             resolve_attachments: Default::default(),
             invalidate_attachments: Default::default(),
@@ -198,6 +216,10 @@ impl super::CommandEncoder {
                 let sampler = slot
                     .sampler_index
                     .and_then(|si| self.state.samplers[si as usize]);
+                if self.state.bound_samplers[texture_index] == Some(sampler) {
+                    continue;
+                }
+                self.state.bound_samplers[texture_index] = Some(sampler);
                 self.cmd_buffer
                     .commands
                     .push(C::BindSampler(texture_index as u32, sampler));
@@ -508,6 +530,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
         }
 
         self.state.render_size = desc.extent;
+        self.state.bound_textures = Default::default();
         self.state.resolve_attachments.clear();
         self.state.invalidate_attachments.clear();
         if let Some(label) = desc.label {
@@ -789,6 +812,23 @@ impl crate::CommandEncoder for super::CommandEncoder {
                 } => {
                     dirty_textures |= 1 << slot;
                     self.state.texture_slots[slot as usize].tex_target = target;
+                    let bound = BoundTexture {
+                        raw,
+                        target,
+                        aspects,
+                        mip_levels: mip_levels.clone(),
+                    };
+                    if self.state.bound_textures[slot as usize].as_ref() == Some(&bound) {
+                        continue;
+                    }
+                    // BindTexture sets the texture's own mip range: a unit
+                    // holding the same texture with another range is stale.
+                    for other in self.state.bound_textures.iter_mut() {
+                        if other.as_ref().is_some_and(|b| b.raw == raw) {
+                            *other = None;
+                        }
+                    }
+                    self.state.bound_textures[slot as usize] = Some(bound);
                     self.cmd_buffer.commands.push(C::BindTexture {
                         slot,
                         texture: raw,
@@ -1203,6 +1243,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
 
     unsafe fn begin_compute_pass(&mut self, desc: &crate::ComputePassDescriptor<super::QuerySet>) {
         debug_assert!(self.state.end_of_pass_timestamp.is_none());
+        self.state.bound_textures = Default::default();
         if let Some(ref t) = desc.timestamp_writes {
             if let Some(index) = t.beginning_of_pass_write_index {
                 unsafe { self.write_timestamp(t.query_set, index) }
