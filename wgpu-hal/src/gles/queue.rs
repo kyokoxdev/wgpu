@@ -1919,8 +1919,18 @@ impl crate::Queue for super::Queue {
                 }
             }
 
-            for command in cmd_buf.commands.iter() {
-                unsafe { self.process(gl, command, &cmd_buf.data_bytes, &cmd_buf.queries) };
+            if replay_profile::enabled() {
+                let mut window = replay_profile::Submit::default();
+                for command in cmd_buf.commands.iter() {
+                    let at = std::time::Instant::now();
+                    unsafe { self.process(gl, command, &cmd_buf.data_bytes, &cmd_buf.queries) };
+                    window.add(command, at.elapsed());
+                }
+                replay_profile::absorb(window);
+            } else {
+                for command in cmd_buf.commands.iter() {
+                    unsafe { self.process(gl, command, &cmd_buf.data_bytes, &cmd_buf.queries) };
+                }
             }
 
             if cmd_buf.label.is_some()
@@ -1961,3 +1971,96 @@ impl crate::Queue for super::Queue {
 unsafe impl Sync for super::Queue {}
 #[cfg(send_sync)]
 unsafe impl Send for super::Queue {}
+
+/// Where GL replay time goes, by command kind: `submit` is where Mesa does the
+/// CPU work of every draw, and nothing else can split it. On only when the
+/// `wgpu_hal::gles::replay` log target is enabled at info (iw4l-nx's profile
+/// build); logs a window every 5 s.
+mod replay_profile {
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    use core::mem::Discriminant;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    use super::C;
+
+    const TARGET: &str = "wgpu_hal::gles::replay";
+
+    pub(super) fn enabled() -> bool {
+        log::log_enabled!(target: TARGET, log::Level::Info)
+    }
+
+    #[derive(Default)]
+    pub(super) struct Submit(HashMap<Discriminant<C>, (Duration, u32, &'static str)>);
+
+    impl Submit {
+        pub(super) fn add(&mut self, command: &C, took: Duration) {
+            let row = self
+                .0
+                .entry(core::mem::discriminant(command))
+                .or_insert_with(|| (Duration::ZERO, 0, kind(command)));
+            row.0 += took;
+            row.1 += 1;
+        }
+    }
+
+    /// The variant name, leaked once per kind (a few dozen).
+    fn kind(command: &C) -> &'static str {
+        let debug = alloc::format!("{command:?}");
+        let end = debug
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .unwrap_or(debug.len());
+        String::leak(String::from(&debug[..end]))
+    }
+
+    struct Window {
+        since: Instant,
+        buffers: u32,
+        rows: HashMap<&'static str, (Duration, u32)>,
+    }
+
+    static WINDOW: Mutex<Option<Window>> = Mutex::new(None);
+
+    pub(super) fn absorb(submit: Submit) {
+        let Ok(mut window) = WINDOW.lock() else { return };
+        let now = Instant::now();
+        let w = window.get_or_insert_with(|| Window {
+            since: now,
+            buffers: 0,
+            rows: HashMap::new(),
+        });
+        w.buffers += 1;
+        for (_, (took, n, name)) in submit.0 {
+            let row = w.rows.entry(name).or_default();
+            row.0 += took;
+            row.1 += n;
+        }
+        let wall = now - w.since;
+        if wall < Duration::from_secs(5) {
+            return;
+        }
+        let mut rows: Vec<_> = w.rows.drain().collect();
+        rows.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+        let total: Duration = rows.iter().map(|r| r.1 .0).sum();
+        let secs = wall.as_secs_f64();
+        let mut line = alloc::format!(
+            "gles replay: {:.1} ms/s over {} cmd buffers in {:.1}s (ms/s, cmds/s)",
+            total.as_secs_f64() * 1000.0 / secs,
+            w.buffers,
+            secs
+        );
+        for (name, (took, n)) in rows.iter().take(24) {
+            line.push_str(&alloc::format!(
+                " | {name}={:.2} n={:.0}",
+                took.as_secs_f64() * 1000.0 / secs,
+                f64::from(*n) / secs
+            ));
+        }
+        w.since = now;
+        w.buffers = 0;
+        drop(window);
+        log::info!(target: TARGET, "{line}");
+    }
+}
