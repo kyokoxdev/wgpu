@@ -847,9 +847,13 @@ impl super::Adapter {
 
         let mut workarounds = super::Workarounds::empty();
 
+        // Horizon: every queue write_buffer/write_texture made a staging GL
+        // buffer (create + storage + map + unmap + delete) on Mesa nouveau,
+        // ~40 a frame at ~0.1 ms each. CPU-backed MAP_WRITE buffers make each
+        // write a memcpy and one glBufferSubData at submit.
         workarounds.set(
             super::Workarounds::EMULATE_BUFFER_MAP,
-            cfg!(any(webgl, Emscripten)),
+            cfg!(any(webgl, Emscripten, target_os = "horizon")),
         );
 
         let r = renderer.to_lowercase();
