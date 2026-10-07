@@ -611,7 +611,13 @@ impl crate::Device for super::Device {
                 }
             }
             // TODO: may also be required for other calls involving `buffer_sub_data_u8_slice` (e.g. copy buffer to buffer and clear buffer)
-            if desc.usage.intersects(wgt::BufferUses::QUERY_RESOLVE) {
+            // Emulated maps turn every queue write into `glBufferSubData` on the
+            // destination, which immutable storage refuses without this bit.
+            // Those buffers are never mapped through GL, so the bit cannot
+            // reach `glMapBufferRange`.
+            if desc.usage.intersects(wgt::BufferUses::QUERY_RESOLVE)
+                || (emulate_map && desc.usage.contains(wgt::BufferUses::COPY_DST))
+            {
                 map_flags |= glow::DYNAMIC_STORAGE_BIT;
             }
             unsafe { gl.buffer_storage(target, raw_size, None, map_flags) };
