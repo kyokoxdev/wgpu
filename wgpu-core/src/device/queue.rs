@@ -1526,7 +1526,10 @@ impl Queue {
                 }
             }
 
-            let pending_writes = self.pending_writes.lock();
+            let pending_writes = {
+                profiling::scope!("Queue::submit pending_writes lock");
+                self.pending_writes.lock()
+            };
 
             let SubmissionResult { snatch_guard } = match submission.submit(pending_writes) {
                 Ok(result) => result,
@@ -1686,7 +1689,11 @@ impl Queue {
             };
         }
 
-        match pending_writes.pre_submit(&self.device.command_allocator, &self.device, self) {
+        let pre_submit = {
+            profiling::scope!("Queue::submit pre_submit");
+            pending_writes.pre_submit(&self.device.command_allocator, &self.device, self)
+        };
+        match pre_submit {
             Ok(Some(pending_execution)) => {
                 executions.insert(0, pending_execution);
             }
@@ -1709,6 +1716,7 @@ impl Queue {
                 submit_surface_textures.push(raw);
             }
 
+            profiling::scope!("Queue::submit hal");
             unsafe {
                 self.raw().submit(
                     &hal_command_buffers,
