@@ -282,9 +282,11 @@ impl<'a> core::ops::Deref for AdapterContextLock<'a> {
 impl<'a> Drop for AdapterContextLock<'a> {
     fn drop(&mut self) {
         if let Some(egl) = self.egl.take() {
+            let at = std::time::Instant::now();
             if let Err(err) = egl.instance.make_current(egl.display, None, None, None) {
                 log::error!("Failed to make EGL context current: {err:?}");
             }
+            super::queue::replay_profile::make_current(at.elapsed());
         }
     }
 }
@@ -321,7 +323,9 @@ impl AdapterContext {
             .expect("Could not lock adapter context. This is most-likely a deadlock.");
 
         let egl = self.egl.as_ref().map(|egl| {
+            let at = std::time::Instant::now();
             egl.make_current();
+            super::queue::replay_profile::make_current(at.elapsed());
             EglContextLock {
                 instance: &egl.instance,
                 display: egl.display,

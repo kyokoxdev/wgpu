@@ -1895,14 +1895,23 @@ impl crate::Queue for super::Queue {
         _surface_textures: &[&super::Texture],
         (signal_fence, signal_value): (&mut super::Fence, crate::FenceValue),
     ) -> Result<(), crate::DeviceError> {
+        let profile = replay_profile::enabled();
+        let mut window = replay_profile::Submit::default();
+        let mut at = std::time::Instant::now();
         let shared = Arc::clone(&self.shared);
         let gl = &shared.context.lock();
+        if profile {
+            at = window.phase("~lock", at);
+        }
         for cmd_buf in command_buffers.iter() {
             // The command encoder assumes a default state when encoding the command buffer.
             // Always reset the state between command_buffers to reflect this assumption. Do
             // this at the beginning of the loop in case something outside of wgpu modified
             // this state prior to commit.
             unsafe { self.reset_state(gl) };
+            if profile {
+                at = window.phase("~reset_state", at);
+            }
             if let Some(ref label) = cmd_buf.label {
                 if self
                     .shared
@@ -1919,14 +1928,14 @@ impl crate::Queue for super::Queue {
                 }
             }
 
-            if replay_profile::enabled() {
-                let mut window = replay_profile::Submit::default();
+            if profile {
+                window.buffers += 1;
                 for command in cmd_buf.commands.iter() {
                     let at = std::time::Instant::now();
                     unsafe { self.process(gl, command, &cmd_buf.data_bytes, &cmd_buf.queries) };
                     window.add(command, at.elapsed());
                 }
-                replay_profile::absorb(window);
+                at = std::time::Instant::now();
             } else {
                 for command in cmd_buf.commands.iter() {
                     unsafe { self.process(gl, command, &cmd_buf.data_bytes, &cmd_buf.queries) };
@@ -1945,11 +1954,18 @@ impl crate::Queue for super::Queue {
 
         signal_fence.maintain(gl);
         signal_fence.signal(gl, signal_value)?;
+        if profile {
+            at = window.phase("~fence", at);
+        }
 
         // This is extremely important. If we don't flush, the above fences may never
         // be signaled, particularly in headless contexts. Headed contexts will
         // often flush every so often, but headless contexts may not.
         unsafe { gl.flush() };
+        if profile {
+            window.phase("~flush", at);
+            replay_profile::absorb(window);
+        }
 
         Ok(())
     }
@@ -1976,10 +1992,11 @@ unsafe impl Send for super::Queue {}
 /// CPU work of every draw, and nothing else can split it. On only when the
 /// `wgpu_hal::gles::replay` log target is enabled at info (iw4l-nx's profile
 /// build); logs a window every 5 s.
-mod replay_profile {
+pub(super) mod replay_profile {
     use alloc::string::String;
     use alloc::vec::Vec;
     use core::mem::Discriminant;
+    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
@@ -1992,13 +2009,36 @@ mod replay_profile {
         log::log_enabled!(target: TARGET, log::Level::Info)
     }
 
+    /// Time in `eglMakeCurrent` (bind on context lock, unbind on release) on
+    /// every thread, not only inside `submit`.
+    static MAKE_CURRENT_NS: AtomicU64 = AtomicU64::new(0);
+    static MAKE_CURRENT_N: AtomicU32 = AtomicU32::new(0);
+
+    pub(in super::super) fn make_current(took: Duration) {
+        MAKE_CURRENT_NS.fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
+        MAKE_CURRENT_N.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One `submit`: commands by kind, plus `~` rows for the work around them
+    /// (context lock, state reset, fence, flush).
     #[derive(Default)]
-    pub(super) struct Submit(HashMap<Discriminant<C>, (Duration, u32, &'static str)>);
+    pub(super) struct Submit {
+        commands: HashMap<Discriminant<C>, (Duration, u32, &'static str)>,
+        phases: Vec<(&'static str, Duration)>,
+        pub(super) buffers: u32,
+    }
 
     impl Submit {
+        /// Charges the time since `since` to `name`; returns now.
+        pub(super) fn phase(&mut self, name: &'static str, since: Instant) -> Instant {
+            let now = Instant::now();
+            self.phases.push((name, now - since));
+            now
+        }
+
         pub(super) fn add(&mut self, command: &C, took: Duration) {
             let row = self
-                .0
+                .commands
                 .entry(core::mem::discriminant(command))
                 .or_insert_with(|| (Duration::ZERO, 0, kind(command)));
             row.0 += took;
@@ -2031,11 +2071,16 @@ mod replay_profile {
             buffers: 0,
             rows: HashMap::new(),
         });
-        w.buffers += 1;
-        for (_, (took, n, name)) in submit.0 {
+        w.buffers += submit.buffers;
+        for (_, (took, n, name)) in submit.commands {
             let row = w.rows.entry(name).or_default();
             row.0 += took;
             row.1 += n;
+        }
+        for (name, took) in submit.phases {
+            let row = w.rows.entry(name).or_default();
+            row.0 += took;
+            row.1 += 1;
         }
         let wall = now - w.since;
         if wall < Duration::from_secs(5) {
@@ -2051,7 +2096,12 @@ mod replay_profile {
             w.buffers,
             secs
         );
-        for (name, (took, n)) in rows.iter().take(24) {
+        line.push_str(&alloc::format!(
+            " | egl make_current (all threads)={:.2} n={:.0}",
+            MAKE_CURRENT_NS.swap(0, Ordering::Relaxed) as f64 / 1e6 / secs,
+            f64::from(MAKE_CURRENT_N.swap(0, Ordering::Relaxed)) / secs
+        ));
+        for (name, (took, n)) in rows.iter().take(28) {
             line.push_str(&alloc::format!(
                 " | {name}={:.2} n={:.0}",
                 took.as_secs_f64() * 1000.0 / secs,
