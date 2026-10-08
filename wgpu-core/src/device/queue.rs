@@ -1196,12 +1196,15 @@ impl Queue {
         let submit_index;
 
         let res = 'error: {
-            let snatch_guard = self.device.snatchable_lock.read();
+            let (snatch_guard, mut fence, mut command_index_guard) = {
+                profiling::scope!("Queue::submit locks");
+                let snatch_guard = self.device.snatchable_lock.read();
 
-            // Fence lock must be acquired after the snatch lock everywhere to avoid deadlocks.
-            let mut fence = self.device.fence.write();
+                // Fence lock must be acquired after the snatch lock everywhere to avoid deadlocks.
+                let fence = self.device.fence.write();
 
-            let mut command_index_guard = self.device.command_indices.write();
+                (snatch_guard, fence, self.device.command_indices.write())
+            };
             command_index_guard.active_submission_index += 1;
             submit_index = command_index_guard.active_submission_index;
 
@@ -1372,7 +1375,10 @@ impl Queue {
                 }
             }
 
-            let mut pending_writes = self.pending_writes.lock();
+            let mut pending_writes = {
+                profiling::scope!("Queue::submit pending_writes lock");
+                self.pending_writes.lock()
+            };
 
             {
                 used_surface_textures.set_size(self.device.tracker_indices.textures.size());
@@ -1416,7 +1422,11 @@ impl Queue {
                 }
             }
 
-            match pending_writes.pre_submit(&self.device.command_allocator, &self.device, self) {
+            let pre_submit = {
+                profiling::scope!("Queue::submit pre_submit");
+                pending_writes.pre_submit(&self.device.command_allocator, &self.device, self)
+            };
+            match pre_submit {
                 Ok(Some(pending_execution)) => {
                     active_executions.insert(0, pending_execution);
                 }
@@ -1442,6 +1452,7 @@ impl Queue {
                     submit_surface_textures.push(raw);
                 }
 
+                profiling::scope!("Queue::submit hal");
                 if let Err(e) = unsafe {
                     self.raw().submit(
                         &hal_command_buffers,
