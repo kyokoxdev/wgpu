@@ -639,7 +639,10 @@ impl super::Adapter {
         );
         let is_mali = renderer.to_lowercase().contains("mali");
         let debug_fns_enabled = match backend_options.debug_fns {
-            wgt::GlDebugFns::Auto => gl.supports_debug() && !is_mali,
+            // Horizon: Mesa debug groups cost a GL call each and nothing reads them.
+            wgt::GlDebugFns::Auto => {
+                gl.supports_debug() && !is_mali && !cfg!(target_os = "horizon")
+            }
             wgt::GlDebugFns::ForceEnabled => gl.supports_debug(),
             wgt::GlDebugFns::Disabled => false,
         };
