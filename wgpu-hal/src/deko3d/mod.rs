@@ -98,6 +98,17 @@ impl crate::Instance for Context {
     type A = Api;
 
     unsafe fn init(desc: &crate::InstanceDescriptor<'_>) -> Result<Self, crate::InstanceError> {
+        // Until the device lands: prove libdeko3d links and a device opens.
+        #[cfg(target_os = "horizon")]
+        unsafe {
+            let device = deko3d_sys::dkDeviceCreate(&deko3d_sys::DkDeviceMaker::default());
+            if device.is_null() {
+                return Err(crate::InstanceError::new(String::from(
+                    "deko3d: dkDeviceCreate failed",
+                )));
+            }
+            deko3d_sys::dkDeviceDestroy(device);
+        }
         Err(crate::InstanceError::new(String::from(
             "deko3d backend not available",
         )))

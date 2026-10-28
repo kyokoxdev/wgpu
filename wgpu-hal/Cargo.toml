@@ -135,7 +135,7 @@ gles = [
     "windows/Win32_UI_WindowsAndMessaging",
 ]
 ## Enables the deko3d backend (Nintendo Switch). Skeleton only for now.
-deko3d = []
+deko3d = ["dep:deko3d-sys"]
 ## Enables the DX12 backend when targeting Windows.
 dx12 = [
     "dep:arrayvec",
@@ -258,6 +258,7 @@ khronos-egl = { workspace = true, optional = true, features = [
     "static",
     "no-pkg-config",
 ] }
+deko3d-sys = { workspace = true, optional = true }
 # Unused on Horizon, kept for a single code base in egl.rs (as for Emscripten).
 libloading = { workspace = true, optional = true }
 renderdoc-sys = { workspace = true, optional = true }

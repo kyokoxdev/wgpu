@@ -1,0 +1,11 @@
+[package]
+name = "deko3d-sys"
+version = "0.5.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Hand-written FFI for devkitPro deko3d (Nintendo Switch)."
+publish = false
+
+[features]
+## Link libdeko3dd (debug build with validation) instead of libdeko3d.
+debug = []

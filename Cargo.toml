@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "cts_runner",
     "deno_webgpu",
+    "deko3d-sys",
 
     # default members
     "benches",
@@ -77,6 +78,7 @@ version = "30.0.1"
 authors = ["gfx-rs developers"]
 
 [workspace.dependencies]
+deko3d-sys = { version = "0.5.0", path = "./deko3d-sys" }
 naga = { version = "30.0.0", path = "./naga" }
 naga-test = { path = "./naga-test" }
 naga-types = { version = "30.0.0", path = "./naga-types" }
