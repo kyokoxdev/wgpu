@@ -2563,7 +2563,7 @@ impl Device {
                     .as_ref()
                     .ok_or(pipeline::CreateShaderModuleError::NotCompiledForBackend)?,
             },
-            wgt::Backend::Noop => {
+            wgt::Backend::Noop | wgt::Backend::Deko3d => {
                 return Err(pipeline::CreateShaderModuleError::NotCompiledForBackend)
             }
             wgt::Backend::BrowserWebGpu => unreachable!(),

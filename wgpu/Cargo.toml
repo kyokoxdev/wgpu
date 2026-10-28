@@ -60,6 +60,9 @@ vulkan = ["wgpu-core?/vulkan"]
 ## Enables the OpenGL/GLES backend on Windows, Linux, Android, and Emscripten.
 gles = ["wgpu-core?/gles"]
 
+## Enables the deko3d backend on Nintendo Switch.
+deko3d = ["wgpu-core?/deko3d"]
+
 ## Enables the WebGPU backend on WebAssembly.
 webgpu = [
     "web",

@@ -134,6 +134,8 @@ gles = [
     "windows/Win32_System_LibraryLoader",
     "windows/Win32_UI_WindowsAndMessaging",
 ]
+## Enables the deko3d backend (Nintendo Switch). Skeleton only for now.
+deko3d = []
 ## Enables the DX12 backend when targeting Windows.
 dx12 = [
     "dep:arrayvec",

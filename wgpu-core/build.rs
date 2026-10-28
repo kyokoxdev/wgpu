@@ -25,6 +25,7 @@ fn main() {
             any(target_os = "linux", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd")
         ) },
         metal: { all(target_vendor = "apple", feature = "metal") },
+        deko3d: { all(windows_linux_android, feature = "deko3d") },
 
         supports_64bit_atomics: { target_has_atomic = "64" }
     }

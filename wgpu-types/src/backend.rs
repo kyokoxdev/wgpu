@@ -49,6 +49,8 @@ pub enum Backend {
     Gl = 4,
     /// WebGPU in the browser
     BrowserWebGpu = 5,
+    /// deko3d (Nintendo Switch)
+    Deko3d = 6,
 }
 
 impl Backend {
@@ -60,6 +62,7 @@ impl Backend {
         Self::Dx12,
         Self::Gl,
         Self::BrowserWebGpu,
+        Self::Deko3d,
     ];
 
     /// Returns the string name of the backend.
@@ -72,6 +75,7 @@ impl Backend {
             Backend::Dx12 => "dx12",
             Backend::Gl => "gl",
             Backend::BrowserWebGpu => "webgpu",
+            Backend::Deko3d => "deko3d",
         }
     }
 }
@@ -117,6 +121,10 @@ bitflags::bitflags! {
         /// Whether WebGPU is targeted is decided upon the creation of the `wgpu::Instance`,
         /// *not* upon adapter creation. See `wgpu::Instance::new`.
         const BROWSER_WEBGPU = 1 << Backend::BrowserWebGpu as u32;
+
+        /// [`Backend::Deko3d`].
+        /// Supported on Nintendo Switch (`target_os = "horizon"`).
+        const DEKO3D = 1 << Backend::Deko3d as u32;
 
         /// All the apis that wgpu offers first tier of support for.
         ///
@@ -179,6 +187,7 @@ impl Backends {
     /// - metal  = "metal" or "mtl"
     /// - gles   = "opengl" or "gles" or "gl"
     /// - webgpu = "webgpu"
+    /// - deko3d = "deko3d"
     pub fn from_comma_list(string: &str) -> Self {
         let mut backends = Self::empty();
         for backend in string.to_lowercase().split(',') {
@@ -189,6 +198,7 @@ impl Backends {
                 "opengl" | "gles" | "gl" => Self::GL,
                 "webgpu" => Self::BROWSER_WEBGPU,
                 "noop" => Self::NOOP,
+                "deko3d" => Self::DEKO3D,
                 b => {
                     log::warn!("unknown backend string '{b}'");
                     continue;
@@ -1016,5 +1026,18 @@ impl GlFenceBehavior {
         } else {
             self
         }
+    }
+}
+
+#[cfg(test)]
+mod deko3d_tests {
+    use super::*;
+
+    #[test]
+    fn deko3d_round_trips() {
+        assert_eq!(Backends::from_comma_list("deko3d"), Backends::DEKO3D);
+        assert_eq!(Backend::Deko3d.to_str(), "deko3d");
+        assert_eq!(Backends::from(Backend::Deko3d), Backends::DEKO3D);
+        assert!(Backend::ALL.contains(&Backend::Deko3d));
     }
 }

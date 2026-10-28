@@ -247,6 +247,9 @@ extern crate wgpu_types as wgt;
 #[macro_use]
 extern crate std;
 
+/// deko3d API internals (Nintendo Switch).
+#[cfg(deko3d)]
+pub mod deko3d;
 /// DirectX12 API internals.
 #[cfg(dx12)]
 pub mod dx12;
@@ -265,6 +268,8 @@ pub mod vulkan;
 
 pub mod auxil;
 pub mod api {
+    #[cfg(deko3d)]
+    pub use super::deko3d::Api as Deko3d;
     #[cfg(dx12)]
     pub use super::dx12::Api as Dx12;
     #[cfg(gles)]

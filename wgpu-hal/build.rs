@@ -9,6 +9,7 @@ fn main() {
         Emscripten: { all(target_os = "emscripten", gles) },
         dx12: { all(target_os = "windows", feature = "dx12") },
         gles: { all(feature = "gles") },
+        deko3d: { all(feature = "deko3d") },
         // Within the GL ES backend, use `std` and be Send + Sync only if we are using a target
         // that, among the ones where the GL ES backend is supported, has `std`.
         gles_with_std: { all(
@@ -28,7 +29,7 @@ fn main() {
             feature = "drm",
             any(target_os = "linux", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd")
         ) },
-        any_backend: { any(dx12, metal, vulkan, gles) },
+        any_backend: { any(dx12, metal, vulkan, gles, deko3d) },
         // ⚠️ Keep in sync with target.cfg() definition in Cargo.toml and cfg_alias in `wgpu` crate ⚠️
         static_dxc: { all(target_os = "windows", feature = "static-dxc", not(target_arch = "aarch64"), target_env = "msvc") },
         supports_64bit_atomics: { target_has_atomic = "64" },

@@ -88,6 +88,8 @@ impl Instance {
         this.try_add_hal(hal::api::Dx12, &instance_desc, telemetry);
         #[cfg(gles)]
         this.try_add_hal(hal::api::Gles, &instance_desc, telemetry);
+        #[cfg(deko3d)]
+        this.try_add_hal(hal::api::Deko3d, &instance_desc, telemetry);
         #[cfg(feature = "noop")]
         this.try_add_hal(hal::api::Noop, &instance_desc, telemetry);
 

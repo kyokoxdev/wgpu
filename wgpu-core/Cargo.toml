@@ -140,6 +140,8 @@ gles = [
     "wgpu-core-deps-windows-linux-android/gles",
     "wgpu-core-deps-emscripten/gles",
 ]
+## deko3d backend (Nintendo Switch)
+deko3d = ["wgpu-core-deps-windows-linux-android/deko3d"]
 
 ## WebGL backend, only available on Emscripten
 webgl = ["wgpu-core-deps-wasm/webgl", "wgpu-types/web"]
