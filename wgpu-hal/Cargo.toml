@@ -135,7 +135,7 @@ gles = [
     "windows/Win32_UI_WindowsAndMessaging",
 ]
 ## Enables the deko3d backend (Nintendo Switch). Skeleton only for now.
-deko3d = ["dep:deko3d-sys", "dep:parking_lot"]
+deko3d = ["dep:deko3d-sys", "dep:parking_lot", "dep:offset-allocator"]
 ## Enables the DX12 backend when targeting Windows.
 dx12 = [
     "dep:arrayvec",
@@ -219,6 +219,7 @@ log = { workspace = true }
 parking_lot = { workspace = true, optional = true }
 # Links only on Horizon; elsewhere it type-checks so the backend builds on host.
 deko3d-sys = { workspace = true, optional = true }
+offset-allocator = { workspace = true, optional = true }
 raw-window-handle.workspace = true
 thiserror.workspace = true
 

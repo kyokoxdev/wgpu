@@ -79,6 +79,7 @@ authors = ["gfx-rs developers"]
 
 [workspace.dependencies]
 deko3d-sys = { version = "0.5.0", path = "./deko3d-sys" }
+offset-allocator = "0.2"
 naga = { version = "30.0.0", path = "./naga" }
 naga-test = { path = "./naga-test" }
 naga-types = { version = "30.0.0", path = "./naga-types" }

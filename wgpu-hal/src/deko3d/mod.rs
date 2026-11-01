@@ -1,7 +1,7 @@
 //! deko3d backend (Nintendo Switch).
 //!
 //! S4 state: real device, queue, fences and swapchain; render passes bind
-//! and clear swapchain images. Buffers are still CPU memory, other textures
+//! and clear swapchain images. Buffers live in pooled GPU memory (CPU-visible), other textures
 //! have no image, and pipelines/draws are recorded as nothing (K1-K3).
 
 #![allow(unused_variables)]
@@ -27,6 +27,7 @@ use crate::TlasInstance;
 mod buffer;
 pub use buffer::Buffer;
 mod command;
+mod memory;
 pub use command::{CommandBuffer, CommandEncoder};
 mod surface;
 pub use surface::Surface;
@@ -84,6 +85,8 @@ pub struct Adapter {
     shared: Arc<DeviceShared>,
 }
 pub struct Device {
+    /// CPU-uncached, GPU-cached; declared first so it drops before the device.
+    buffers: Mutex<memory::Pool>,
     shared: Arc<DeviceShared>,
     queue: Arc<QueueShared>,
 }
@@ -369,6 +372,10 @@ impl crate::Adapter for Adapter {
         });
         Ok(crate::OpenDevice {
             device: Device {
+                buffers: Mutex::new(memory::Pool::new(
+                    self.shared.raw,
+                    dk::DkMemBlockFlags_CpuUncached | dk::DkMemBlockFlags_GpuCached,
+                )),
                 shared: Arc::clone(&self.shared),
                 queue: Arc::clone(&queue),
             },
@@ -500,10 +507,12 @@ impl crate::Device for Device {
     type A = Api;
 
     unsafe fn create_buffer(&self, desc: &crate::BufferDescriptor) -> DeviceResult<Buffer> {
-        Buffer::new(desc)
+        Buffer::new(&mut self.buffers.lock(), desc)
     }
 
-    unsafe fn destroy_buffer(&self, buffer: Buffer) {}
+    unsafe fn destroy_buffer(&self, buffer: Buffer) {
+        self.buffers.lock().free(buffer.mem);
+    }
     unsafe fn add_raw_buffer(&self, _buffer: &Buffer) {}
 
     unsafe fn map_buffer(

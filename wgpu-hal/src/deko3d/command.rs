@@ -35,7 +35,7 @@ unsafe extern "C" fn add_mem(user: *mut c_void, cmdbuf: dk::DkCmdBuf, min: usize
 }
 
 /// Records straight into a `DkCmdBuf`. Buffer commands still run on the CPU
-/// at submit (buffers are CPU memory until K1).
+/// at submit, through the buffers' CPU mapping (GPU copies come with K1).
 pub struct CommandEncoder {
     raw: dk::DkCmdBuf,
     mem: alloc::boxed::Box<CmdMem>,
