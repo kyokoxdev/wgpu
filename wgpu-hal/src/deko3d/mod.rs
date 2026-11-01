@@ -389,12 +389,20 @@ impl crate::Adapter for Adapter {
         } else if format.is_depth_stencil_format() {
             Tfc::SAMPLED | Tfc::DEPTH_STENCIL_ATTACHMENT | Tfc::MULTISAMPLE_X4 | copy
         } else {
+            // Maxwell image load/store covers the plain color formats; WebGPU
+            // never allows storage on sRGB.
+            let storage = if format.is_srgb() {
+                Tfc::empty()
+            } else {
+                Tfc::STORAGE_READ_ONLY | Tfc::STORAGE_WRITE_ONLY | Tfc::STORAGE_READ_WRITE
+            };
             Tfc::SAMPLED
                 | Tfc::SAMPLED_LINEAR
                 | Tfc::COLOR_ATTACHMENT
                 | Tfc::COLOR_ATTACHMENT_BLEND
                 | Tfc::MULTISAMPLE_X4
                 | Tfc::MULTISAMPLE_RESOLVE
+                | storage
                 | copy
         }
     }
