@@ -253,6 +253,10 @@ impl crate::Adapter for Context {
         &self,
         format: wgt::TextureFormat,
     ) -> crate::TextureFormatCapabilities {
+        // The bake records what the device would build: refuse no format.
+        if cfg!(feature = "deko3d-bake") {
+            return crate::TextureFormatCapabilities::all();
+        }
         crate::TextureFormatCapabilities::empty()
     }
 
