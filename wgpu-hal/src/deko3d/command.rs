@@ -1,13 +1,99 @@
 use alloc::vec::Vec;
-use core::mem;
-use core::ops::Range;
+use core::{ffi::c_void, mem, ops::Range, ptr};
 
-use super::{Api, Buffer, DeviceResult, Resource};
+use deko3d_sys as dk;
 
-/// Command buffer type, which performs double duty as the command encoder type too.
+use super::{Api, Buffer, DeviceResult, Resource, Texture, TextureView};
+
+/// Command memory chunk size; `cbAddMem` grabs another when one fills.
+const CMD_CHUNK: u32 = 0x10000;
+
+/// Command memory owned by one encoder. Boxed: deko3d calls back into it
+/// through `userData`. Chunks are rewound (not freed) in `reset_all`.
+struct CmdMem {
+    device: dk::DkDevice,
+    chunks: Vec<dk::DkMemBlock>,
+    next: usize,
+}
+
+unsafe extern "C" fn add_mem(user: *mut c_void, cmdbuf: dk::DkCmdBuf, min: usize) {
+    let mem = unsafe { &mut *user.cast::<CmdMem>() };
+    let fits = |b: dk::DkMemBlock| unsafe { dk::dkMemBlockGetSize(b) } as usize >= min;
+    if !mem.chunks.get(mem.next).is_some_and(|&b| fits(b)) {
+        let size = (min as u32)
+            .max(CMD_CHUNK)
+            .next_multiple_of(dk::DK_MEMBLOCK_ALIGNMENT);
+        let block = unsafe { dk::dkMemBlockCreate(&dk::DkMemBlockMaker::new(mem.device, size)) };
+        // deko3d reports the failure through the debug callback; recording
+        // past this point is undefined, so stop here.
+        assert!(!block.is_null(), "deko3d: out of command memory");
+        mem.chunks.insert(mem.next, block);
+    }
+    let block = mem.chunks[mem.next];
+    mem.next += 1;
+    unsafe { dk::dkCmdBufAddMemory(cmdbuf, block, 0, dk::dkMemBlockGetSize(block)) };
+}
+
+/// Records straight into a `DkCmdBuf`. Buffer commands still run on the CPU
+/// at submit (buffers are CPU memory until K1).
+pub struct CommandEncoder {
+    raw: dk::DkCmdBuf,
+    mem: alloc::boxed::Box<CmdMem>,
+    cpu: Vec<Command>,
+}
+
+// SAFETY: the encoder is used from one thread at a time (`&mut self`).
+unsafe impl Send for CommandEncoder {}
+unsafe impl Sync for CommandEncoder {}
+
+impl core::fmt::Debug for CommandEncoder {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("CommandEncoder")
+    }
+}
+
+impl Drop for CommandEncoder {
+    fn drop(&mut self) {
+        // wgpu-core drops encoders only after their submissions retire.
+        unsafe {
+            dk::dkCmdBufDestroy(self.raw);
+            for &block in &self.mem.chunks {
+                dk::dkMemBlockDestroy(block);
+            }
+        }
+    }
+}
+
+impl CommandEncoder {
+    pub(super) fn new(device: dk::DkDevice) -> DeviceResult<Self> {
+        let mut mem = alloc::boxed::Box::new(CmdMem {
+            device,
+            chunks: Vec::new(),
+            next: 0,
+        });
+        let raw = unsafe {
+            dk::dkCmdBufCreate(&dk::DkCmdBufMaker {
+                device,
+                userData: ptr::from_mut(&mut *mem).cast(),
+                cbAddMem: Some(add_mem),
+            })
+        };
+        if raw.is_null() {
+            return Err(crate::DeviceError::Unexpected);
+        }
+        Ok(Self {
+            raw,
+            mem,
+            cpu: Vec::new(),
+        })
+    }
+}
+
+/// A finished list plus the CPU-side buffer work recorded with it.
 #[derive(Debug)]
 pub struct CommandBuffer {
-    commands: Vec<Command>,
+    list: dk::DkCmdList,
+    cpu: Vec<Command>,
 }
 
 #[derive(Debug)]
@@ -28,35 +114,39 @@ impl CommandBuffer {
     ///
     /// Must be called with appropriate synchronization for the resources affected by the command,
     /// such as ensuring that buffers are not accessed by a command while aliasing references exist.
-    pub(crate) unsafe fn execute(&self) {
-        for command in &self.commands {
+    pub(super) unsafe fn submit(&self, queue: dk::DkQueue) {
+        for command in &self.cpu {
             unsafe { command.execute() };
         }
-    }
-
-    pub(crate) fn new() -> Self {
-        Self {
-            commands: Vec::new(),
+        if self.list != 0 {
+            unsafe { dk::dkQueueSubmitCommands(queue, self.list) };
         }
     }
 }
 
-impl crate::CommandEncoder for CommandBuffer {
+impl crate::CommandEncoder for CommandEncoder {
     type A = Api;
 
     unsafe fn begin_encoding(&mut self, label: crate::Label) -> DeviceResult<()> {
-        assert!(self.commands.is_empty());
+        assert!(self.cpu.is_empty());
         Ok(())
     }
     unsafe fn discard_encoding(&mut self) {
-        self.commands.clear();
+        // The list is dropped; its memory comes back in `reset_all`.
+        unsafe { dk::dkCmdBufFinishList(self.raw) };
+        self.cpu.clear();
     }
     unsafe fn end_encoding(&mut self) -> DeviceResult<CommandBuffer> {
         Ok(CommandBuffer {
-            commands: mem::take(&mut self.commands),
+            list: unsafe { dk::dkCmdBufFinishList(self.raw) },
+            cpu: mem::take(&mut self.cpu),
         })
     }
-    unsafe fn reset_all<I>(&mut self, command_buffers: I) {}
+    unsafe fn reset_all<I>(&mut self, command_buffers: I) {
+        // Every list from this encoder has retired on the GPU.
+        unsafe { dk::dkCmdBufClear(self.raw) };
+        self.mem.next = 0;
+    }
 
     unsafe fn transition_buffers<'a, T>(&mut self, barriers: T)
     where
@@ -66,12 +156,12 @@ impl crate::CommandEncoder for CommandBuffer {
 
     unsafe fn transition_textures<'a, T>(&mut self, barriers: T)
     where
-        T: Iterator<Item = crate::TextureBarrier<'a, Resource>>,
+        T: Iterator<Item = crate::TextureBarrier<'a, Texture>>,
     {
     }
 
     unsafe fn clear_buffer(&mut self, buffer: &Buffer, range: crate::MemoryRange) {
-        self.commands.push(Command::ClearBuffer {
+        self.cpu.push(Command::ClearBuffer {
             buffer: buffer.clone(),
             range,
         })
@@ -81,7 +171,7 @@ impl crate::CommandEncoder for CommandBuffer {
     where
         T: Iterator<Item = crate::BufferCopy>,
     {
-        self.commands.push(Command::CopyBufferToBuffer {
+        self.cpu.push(Command::CopyBufferToBuffer {
             src: src.clone(),
             dst: dst.clone(),
             regions: regions.collect(),
@@ -92,7 +182,7 @@ impl crate::CommandEncoder for CommandBuffer {
     unsafe fn copy_external_image_to_texture<T>(
         &mut self,
         src: &wgt::CopyExternalImageSourceInfo,
-        dst: &Resource,
+        dst: &Texture,
         dst_premultiplication: bool,
         regions: T,
     ) where
@@ -102,21 +192,21 @@ impl crate::CommandEncoder for CommandBuffer {
 
     unsafe fn copy_texture_to_texture<T>(
         &mut self,
-        src: &Resource,
+        src: &Texture,
         src_usage: wgt::TextureUses,
-        dst: &Resource,
+        dst: &Texture,
         regions: T,
     ) {
         // TODO: consider implementing this and other texture manipulation
     }
 
-    unsafe fn copy_buffer_to_texture<T>(&mut self, src: &Buffer, dst: &Resource, regions: T) {
+    unsafe fn copy_buffer_to_texture<T>(&mut self, src: &Buffer, dst: &Texture, regions: T) {
         // TODO: consider implementing this and other texture manipulation
     }
 
     unsafe fn copy_texture_to_buffer<T>(
         &mut self,
-        src: &Resource,
+        src: &Texture,
         src_usage: wgt::TextureUses,
         dst: &Buffer,
         regions: T,
@@ -148,8 +238,91 @@ impl crate::CommandEncoder for CommandBuffer {
 
     unsafe fn begin_render_pass(
         &mut self,
-        desc: &crate::RenderPassDescriptor<Resource, Resource>,
+        desc: &crate::RenderPassDescriptor<Resource, TextureView>,
     ) -> DeviceResult<()> {
+        // S4: only targets with a DkImage (swapchain images) bind and clear.
+        let mut views = [dk::DkImageView::new(ptr::null()); dk::DK_MAX_RENDER_TARGETS as usize];
+        let mut targets = [ptr::null::<dk::DkImageView>(); dk::DK_MAX_RENDER_TARGETS as usize];
+        let mut count = 0;
+        for (i, at) in desc.color_attachments.iter().enumerate() {
+            if let Some(at) = at.as_ref().filter(|at| !at.target.view.image.is_null()) {
+                views[i] = dk::DkImageView::new(at.target.view.image);
+                targets[i] = &views[i];
+                count = i + 1;
+            }
+        }
+        let depth_view = desc
+            .depth_stencil_attachment
+            .as_ref()
+            .filter(|ds| !ds.target.view.image.is_null())
+            .map(|ds| dk::DkImageView::new(ds.target.view.image));
+        if count == 0 && depth_view.is_none() {
+            return Ok(());
+        }
+        let depth_ptr = depth_view.as_ref().map_or(ptr::null(), ptr::from_ref);
+        let (w, h) = (desc.extent.width, desc.extent.height);
+        unsafe {
+            dk::dkCmdBufBindRenderTargets(self.raw, targets.as_ptr(), count as u32, depth_ptr);
+            dk::dkCmdBufSetViewports(
+                self.raw,
+                0,
+                &dk::DkViewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: w as f32,
+                    height: h as f32,
+                    near: 0.0,
+                    far: 1.0,
+                },
+                1,
+            );
+            dk::dkCmdBufSetScissors(
+                self.raw,
+                0,
+                &dk::DkScissor {
+                    x: 0,
+                    y: 0,
+                    width: w,
+                    height: h,
+                },
+                1,
+            );
+        }
+        for (i, at) in desc.color_attachments.iter().enumerate().take(count) {
+            let Some(at) = at.as_ref() else { continue };
+            if targets[i].is_null() || !at.ops.contains(crate::AttachmentOps::LOAD_CLEAR) {
+                continue;
+            }
+            let c = at.clear_value;
+            let data = [c.r as f32, c.g as f32, c.b as f32, c.a as f32];
+            unsafe {
+                dk::dkCmdBufClearColor(
+                    self.raw,
+                    i as u32,
+                    dk::DkColorMask_RGBA,
+                    data.as_ptr().cast(),
+                )
+            };
+        }
+        if let Some(ds) = desc
+            .depth_stencil_attachment
+            .as_ref()
+            .filter(|_| depth_view.is_some())
+        {
+            let depth = ds.depth_ops.contains(crate::AttachmentOps::LOAD_CLEAR);
+            let stencil = ds.stencil_ops.contains(crate::AttachmentOps::LOAD_CLEAR);
+            if depth || stencil {
+                unsafe {
+                    dk::dkCmdBufClearDepthStencil(
+                        self.raw,
+                        depth,
+                        ds.clear_value.0,
+                        if stencil { 0xff } else { 0 },
+                        ds.clear_value.1 as u8,
+                    )
+                };
+            }
+        }
         Ok(())
     }
     unsafe fn end_render_pass(&mut self) {}

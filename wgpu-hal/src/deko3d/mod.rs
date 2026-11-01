@@ -1,38 +1,154 @@
-//! deko3d backend (Nintendo Switch). Starts as a copy of the noop backend;
-//! `init` fails until the device, queue and swapchain land.
+//! deko3d backend (Nintendo Switch).
+//!
+//! S4 state: real device, queue, fences and swapchain; render passes bind
+//! and clear swapchain images. Buffers are still CPU memory, other textures
+//! have no image, and pipelines/draws are recorded as nothing (K1-K3).
 
 #![allow(unused_variables)]
 
-use alloc::{string::String, sync::Arc, vec, vec::Vec};
-use core::{ptr, sync::atomic::Ordering, time::Duration};
+use alloc::{boxed::Box, collections::VecDeque, string::String, sync::Arc, vec, vec::Vec};
+use core::{
+    ffi::{c_char, c_void, CStr},
+    ptr,
+    sync::atomic::Ordering,
+    time::Duration,
+};
 
 #[cfg(supports_64bit_atomics)]
 use core::sync::atomic::AtomicU64;
 #[cfg(not(supports_64bit_atomics))]
 use portable_atomic::AtomicU64;
 
+use deko3d_sys as dk;
+use parking_lot::Mutex;
+
 use crate::TlasInstance;
 
 mod buffer;
 pub use buffer::Buffer;
 mod command;
-pub use command::CommandBuffer;
+pub use command::{CommandBuffer, CommandEncoder};
+mod surface;
+pub use surface::Surface;
 
 #[derive(Clone, Debug)]
 pub struct Api;
 
-#[derive(Debug)]
-pub struct Context {
-    options: Arc<wgt::NoopBackendOptions>,
+/// Owns the `DkDevice`; everything else holds an `Arc` to it.
+struct DeviceShared {
+    raw: dk::DkDevice,
 }
-#[derive(Debug)]
-pub struct Encoder;
+// SAFETY: deko3d device calls used here are thread-safe (object creation).
+unsafe impl Send for DeviceShared {}
+unsafe impl Sync for DeviceShared {}
+
+impl Drop for DeviceShared {
+    fn drop(&mut self) {
+        unsafe { dk::dkDeviceDestroy(self.raw) };
+    }
+}
+
+/// The one graphics queue. deko3d queues are not thread-safe, so every use
+/// goes through the lock.
+struct QueueShared {
+    raw: Mutex<dk::DkQueue>,
+    _device: Arc<DeviceShared>,
+}
+unsafe impl Send for QueueShared {}
+unsafe impl Sync for QueueShared {}
+
+impl QueueShared {
+    unsafe fn wait_idle(&self) {
+        unsafe { dk::dkQueueWaitIdle(*self.raw.lock()) };
+    }
+
+    unsafe fn present(&self, swapchain: dk::DkSwapchain, texture: &Texture) {
+        unsafe { dk::dkQueuePresentImage(*self.raw.lock(), swapchain, texture.slot) };
+    }
+}
+
+impl Drop for QueueShared {
+    fn drop(&mut self) {
+        let raw = *self.raw.get_mut();
+        unsafe {
+            dk::dkQueueWaitIdle(raw);
+            dk::dkQueueDestroy(raw);
+        }
+    }
+}
+
+pub struct Instance {
+    shared: Arc<DeviceShared>,
+}
+pub struct Adapter {
+    shared: Arc<DeviceShared>,
+}
+pub struct Device {
+    shared: Arc<DeviceShared>,
+    queue: Arc<QueueShared>,
+}
+pub struct Queue {
+    shared: Arc<QueueShared>,
+}
+
+macro_rules! opaque_debug {
+    ($($t:ty),*) => {$(
+        impl core::fmt::Debug for $t {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str(stringify!($t))
+            }
+        }
+    )*};
+}
+opaque_debug!(
+    Instance,
+    Adapter,
+    Device,
+    Queue,
+    Texture,
+    TextureView,
+    Fence
+);
+
+/// A texture. Only swapchain images have a `DkImage` so far (`image` is null
+/// otherwise); `slot`/`acquire` are meaningful only for those.
+pub struct Texture {
+    image: *const dk::DkImage,
+    slot: i32,
+    acquire: dk::DkFence,
+}
+unsafe impl Send for Texture {}
+unsafe impl Sync for Texture {}
+
+pub struct TextureView {
+    image: *const dk::DkImage,
+}
+unsafe impl Send for TextureView {}
+unsafe impl Sync for TextureView {}
+
 #[derive(Debug)]
 pub struct Resource;
 
-#[derive(Debug)]
+/// Signalled by queue submits. Each submit pushes one boxed `DkFence`
+/// (deko3d writes through the pointer) with the wgpu value it completes.
 pub struct Fence {
-    value: AtomicU64,
+    done: AtomicU64,
+    pending: Mutex<VecDeque<(crate::FenceValue, Box<dk::DkFence>)>>,
+}
+
+impl Fence {
+    /// Retires signalled submits; returns the last completed value.
+    fn poll(&self) -> crate::FenceValue {
+        let mut pending = self.pending.lock();
+        while let Some((value, fence)) = pending.front_mut() {
+            if unsafe { dk::dkFenceWait(&mut **fence, 0) } != dk::DkResult_Success {
+                break;
+            }
+            self.done.store(*value, Ordering::Release);
+            pending.pop_front();
+        }
+        self.done.load(Ordering::Acquire)
+    }
 }
 
 type DeviceResult<T> = Result<T, crate::DeviceError>;
@@ -40,19 +156,19 @@ type DeviceResult<T> = Result<T, crate::DeviceError>;
 impl crate::Api for Api {
     const VARIANT: wgt::Backend = wgt::Backend::Deko3d;
 
-    type Instance = Context;
-    type Surface = Context;
-    type Adapter = Context;
-    type Device = Context;
+    type Instance = Instance;
+    type Surface = Surface;
+    type Adapter = Adapter;
+    type Device = Device;
 
-    type Queue = Context;
-    type CommandEncoder = CommandBuffer;
+    type Queue = Queue;
+    type CommandEncoder = CommandEncoder;
     type CommandBuffer = CommandBuffer;
 
     type Buffer = Buffer;
-    type Texture = Resource;
-    type SurfaceTexture = Resource;
-    type TextureView = Resource;
+    type Texture = Texture;
+    type SurfaceTexture = Texture;
+    type TextureView = TextureView;
     type Sampler = Resource;
     type QuerySet = Resource;
     type Fence = Fence;
@@ -68,7 +184,20 @@ impl crate::Api for Api {
     type ComputePipeline = Resource;
 }
 
-crate::impl_dyn_resource!(Buffer, CommandBuffer, Context, Fence, Resource);
+crate::impl_dyn_resource!(
+    Adapter,
+    Buffer,
+    CommandBuffer,
+    CommandEncoder,
+    Device,
+    Fence,
+    Instance,
+    Queue,
+    Resource,
+    Surface,
+    Texture,
+    TextureView
+);
 
 impl crate::DynAccelerationStructure for Resource {}
 impl crate::DynBindGroup for Resource {}
@@ -84,110 +213,128 @@ impl crate::DynRenderPipeline for Resource {}
 impl crate::DynRayTracingPipeline for Resource {}
 impl crate::DynSampler for Resource {}
 impl crate::DynShaderModule for Resource {}
-impl crate::DynSurfaceTexture for Resource {}
-impl crate::DynTexture for Resource {}
-impl crate::DynTextureView for Resource {}
+impl crate::DynSurfaceTexture for Texture {}
+impl crate::DynTexture for Texture {}
+impl crate::DynTextureView for TextureView {}
 
-impl core::borrow::Borrow<dyn crate::DynTexture> for Resource {
+impl core::borrow::Borrow<dyn crate::DynTexture> for Texture {
     fn borrow(&self) -> &dyn crate::DynTexture {
         self
     }
 }
 
-impl crate::Instance for Context {
+unsafe extern "C" fn debug_callback(
+    _user: *mut c_void,
+    context: *const c_char,
+    result: dk::DkResult,
+    message: *const c_char,
+) {
+    let text = |p: *const c_char| {
+        if p.is_null() {
+            "?".into()
+        } else {
+            unsafe { CStr::from_ptr(p) }.to_string_lossy()
+        }
+    };
+    log::error!("deko3d: {} ({result}): {}", text(context), text(message));
+}
+
+impl crate::Instance for Instance {
     type A = Api;
 
     unsafe fn init(desc: &crate::InstanceDescriptor<'_>) -> Result<Self, crate::InstanceError> {
-        // Until the device lands: prove libdeko3d links and a device opens.
-        #[cfg(target_os = "horizon")]
-        unsafe {
-            let device = deko3d_sys::dkDeviceCreate(&deko3d_sys::DkDeviceMaker::default());
-            if device.is_null() {
-                return Err(crate::InstanceError::new(String::from(
-                    "deko3d: dkDeviceCreate failed",
-                )));
-            }
-            deko3d_sys::dkDeviceDestroy(device);
+        if !cfg!(target_os = "horizon") {
+            return Err(crate::InstanceError::new(String::from(
+                "deko3d: only available on Horizon",
+            )));
         }
-        Err(crate::InstanceError::new(String::from(
-            "deko3d backend not available",
-        )))
+        let maker = dk::DkDeviceMaker {
+            cbDebug: Some(debug_callback),
+            ..Default::default()
+        };
+        let raw = unsafe { dk::dkDeviceCreate(&maker) };
+        if raw.is_null() {
+            return Err(crate::InstanceError::new(String::from(
+                "deko3d: dkDeviceCreate failed",
+            )));
+        }
+        Ok(Instance {
+            shared: Arc::new(DeviceShared { raw }),
+        })
     }
+
     unsafe fn create_surface(
         &self,
         _display_handle: raw_window_handle::RawDisplayHandle,
-        _window_handle: raw_window_handle::RawWindowHandle,
-    ) -> Result<Context, crate::InstanceError> {
-        Ok(Context {
-            options: Arc::clone(&self.options),
+        window_handle: raw_window_handle::RawWindowHandle,
+    ) -> Result<Surface, crate::InstanceError> {
+        // platform_nx passes libnx's NWindow as an AndroidNdk handle.
+        let raw_window_handle::RawWindowHandle::AndroidNdk(handle) = window_handle else {
+            return Err(crate::InstanceError::new(String::from(
+                "deko3d: expected an NWindow (AndroidNdk) window handle",
+            )));
+        };
+        Ok(Surface {
+            window: handle.a_native_window.as_ptr(),
+            swapchain: Mutex::new(None),
         })
     }
+
     unsafe fn enumerate_adapters(
         &self,
-        _surface_hint: Option<&Context>,
+        _surface_hint: Option<&Surface>,
     ) -> Vec<crate::ExposedAdapter<Api>> {
-        let device_type = self.options.device_type.unwrap_or(wgt::DeviceType::Other);
-        let subgroup_min_size = self
-            .options
-            .subgroup_min_size
-            .unwrap_or(wgt::MINIMUM_SUBGROUP_MIN_SIZE);
-        let subgroup_max_size = self
-            .options
-            .subgroup_max_size
-            .unwrap_or(wgt::MAXIMUM_SUBGROUP_MAX_SIZE);
-        let features = self.options.features.unwrap_or(wgt::Features::all());
-        let limits = self
-            .options
-            .limits
-            .clone()
-            .unwrap_or(CAPABILITIES.limits.clone());
-
-        let info = wgt::AdapterInfo {
-            subgroup_min_size,
-            subgroup_max_size,
-            ..adapter_info()
-        };
-
-        let capabilities = crate::Capabilities {
-            limits,
-            ..CAPABILITIES
-        };
-
         vec![crate::ExposedAdapter {
-            adapter: Context {
-                options: Arc::clone(&self.options),
+            adapter: Adapter {
+                shared: Arc::clone(&self.shared),
             },
-            info,
-            features,
-            capabilities,
+            info: adapter_info(),
+            features: features(),
+            capabilities: capabilities(),
         }]
     }
 }
 
-/// Returns the adapter info for the noop backend.
-///
-/// This is used in the test harness to construct info about
-/// the noop backend adapter without actually initializing wgpu.
 pub fn adapter_info() -> wgt::AdapterInfo {
     wgt::AdapterInfo {
-        name: String::from("deko3d"),
-        driver: String::from("wgpu"),
+        name: String::from("Tegra X1 (deko3d)"),
+        driver: String::from("deko3d"),
         ..wgt::AdapterInfo::new(wgt::DeviceType::IntegratedGpu, wgt::Backend::Deko3d)
     }
 }
 
-/// The capabilities of the noop backend.
-///
-/// This is used in the test harness to construct capabilities
-/// of the noop backend without actually initializing wgpu.
-pub const CAPABILITIES: crate::Capabilities = {
+/// What the game requests (`bootstrap/src/plugins.rs`) plus what deko3d
+/// plainly has. F2 audits this list against the finished backend.
+fn features() -> wgt::Features {
+    wgt::Features::TEXTURE_COMPRESSION_BC
+        | wgt::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
+        | wgt::Features::DEPTH32FLOAT_STENCIL8
+        | wgt::Features::DEPTH_CLIP_CONTROL
+        | wgt::Features::POLYGON_MODE_LINE
+        | wgt::Features::INDIRECT_FIRST_INSTANCE
+}
+
+/// Limits from the `DK_*` per-stage binding tables.
+fn capabilities() -> crate::Capabilities {
+    let limits = wgt::Limits {
+        max_sampled_textures_per_shader_stage: dk::DK_NUM_TEXTURE_BINDINGS,
+        max_samplers_per_shader_stage: dk::DK_NUM_TEXTURE_BINDINGS,
+        max_uniform_buffers_per_shader_stage: dk::DK_NUM_UNIFORM_BUFS,
+        max_storage_buffers_per_shader_stage: dk::DK_NUM_STORAGE_BUFS,
+        max_storage_textures_per_shader_stage: dk::DK_NUM_IMAGE_BINDINGS,
+        max_uniform_buffer_binding_size: dk::DK_UNIFORM_BUF_MAX_SIZE as u64,
+        max_color_attachments: dk::DK_MAX_RENDER_TARGETS,
+        max_vertex_buffers: dk::DK_MAX_VERTEX_BUFFERS,
+        max_vertex_attributes: dk::DK_MAX_VERTEX_ATTRIBS,
+        ..wgt::Limits::default()
+    };
+    let four = wgt::BufferSize::new(4).unwrap();
     crate::Capabilities {
-        limits: wgt::Limits::unlimited(),
+        limits,
         alignments: crate::Alignments {
-            // All maximally permissive
-            buffer_copy_offset: wgt::BufferSize::MIN,
-            buffer_copy_pitch: wgt::BufferSize::MIN,
-            uniform_bounds_check_alignment: wgt::BufferSize::MIN,
+            buffer_copy_offset: four,
+            buffer_copy_pitch: four,
+            uniform_bounds_check_alignment: four,
             raw_tlas_instance_size: 0,
             ray_tracing_scratch_buffer_alignment: 1,
             ray_tracing_pipeline_group_data_size: 1,
@@ -201,32 +348,9 @@ pub const CAPABILITIES: crate::Capabilities = {
         },
         cooperative_matrix_properties: Vec::new(),
     }
-};
-
-impl crate::Surface for Context {
-    type A = Api;
-
-    unsafe fn configure(
-        &self,
-        device: &Context,
-        config: &crate::SurfaceConfiguration,
-    ) -> Result<(), crate::SurfaceError> {
-        Ok(())
-    }
-
-    unsafe fn unconfigure(&self, device: &Context) {}
-
-    unsafe fn acquire_texture(
-        &self,
-        _timeout: Option<Duration>,
-        _fence: &Fence,
-    ) -> Result<crate::AcquiredSurfaceTexture<Api>, crate::SurfaceError> {
-        Err(crate::SurfaceError::Timeout)
-    }
-    unsafe fn discard_texture(&self, texture: Resource) {}
 }
 
-impl crate::Adapter for Context {
+impl crate::Adapter for Adapter {
     type A = Api;
 
     unsafe fn open(
@@ -235,24 +359,65 @@ impl crate::Adapter for Context {
         _limits: &wgt::Limits,
         _memory_hints: &wgt::MemoryHints,
     ) -> DeviceResult<crate::OpenDevice<Api>> {
+        let raw = unsafe { dk::dkQueueCreate(&dk::DkQueueMaker::new(self.shared.raw)) };
+        if raw.is_null() {
+            return Err(crate::DeviceError::Unexpected);
+        }
+        let queue = Arc::new(QueueShared {
+            raw: Mutex::new(raw),
+            _device: Arc::clone(&self.shared),
+        });
         Ok(crate::OpenDevice {
-            device: Context {
-                options: Arc::clone(&self.options),
+            device: Device {
+                shared: Arc::clone(&self.shared),
+                queue: Arc::clone(&queue),
             },
-            queue: Context {
-                options: Arc::clone(&self.options),
-            },
+            queue: Queue { shared: queue },
         })
     }
+
     unsafe fn texture_format_capabilities(
         &self,
         format: wgt::TextureFormat,
     ) -> crate::TextureFormatCapabilities {
-        crate::TextureFormatCapabilities::empty()
+        use crate::TextureFormatCapabilities as Tfc;
+        // ponytail: blanket answer per format class; F2 replaces it with a
+        // per-format table from the deko3d format list.
+        let copy = Tfc::COPY_SRC | Tfc::COPY_DST;
+        if format.is_compressed() {
+            Tfc::SAMPLED | Tfc::SAMPLED_LINEAR | copy
+        } else if format.is_depth_stencil_format() {
+            Tfc::SAMPLED | Tfc::DEPTH_STENCIL_ATTACHMENT | Tfc::MULTISAMPLE_X4 | copy
+        } else {
+            Tfc::SAMPLED
+                | Tfc::SAMPLED_LINEAR
+                | Tfc::COLOR_ATTACHMENT
+                | Tfc::COLOR_ATTACHMENT_BLEND
+                | Tfc::MULTISAMPLE_X4
+                | Tfc::MULTISAMPLE_RESOLVE
+                | copy
+        }
     }
 
-    unsafe fn surface_capabilities(&self, surface: &Context) -> Option<crate::SurfaceCapabilities> {
-        None
+    unsafe fn surface_capabilities(&self, surface: &Surface) -> Option<crate::SurfaceCapabilities> {
+        let formats = [
+            wgt::TextureFormat::Rgba8UnormSrgb,
+            wgt::TextureFormat::Rgba8Unorm,
+        ]
+        .into_iter()
+        .map(|format| wgt::SurfaceFormatCapabilities {
+            format,
+            color_spaces: wgt::SurfaceColorSpaces::SRGB,
+        })
+        .collect();
+        Some(crate::SurfaceCapabilities {
+            formats,
+            maximum_frame_latency: 1..=2,
+            current_extent: None,
+            usage: wgt::TextureUses::COLOR_TARGET,
+            present_modes: vec![wgt::PresentMode::Fifo, wgt::PresentMode::Immediate],
+            composite_alpha_modes: vec![wgt::CompositeAlphaMode::Opaque],
+        })
     }
 
     unsafe fn get_presentation_timestamp(&self) -> wgt::PresentationTimestamp {
@@ -270,31 +435,46 @@ impl crate::Adapter for Context {
     }
 }
 
-impl crate::Queue for Context {
+impl crate::Queue for Queue {
     type A = Api;
 
     unsafe fn submit(
         &self,
         command_buffers: &[&CommandBuffer],
-        surface_textures: &[&Resource],
+        surface_textures: &[&Texture],
         (fence, fence_value): (&Fence, crate::FenceValue),
     ) -> DeviceResult<()> {
-        // All commands are executed synchronously.
-        for cb in command_buffers {
-            // SAFETY: Caller is responsible for ensuring synchronization between commands and
-            // other mutations.
+        let queue = *self.shared.raw.lock();
+        // Rendering into a swapchain image waits for its acquire.
+        for texture in surface_textures {
             unsafe {
-                cb.execute();
-            }
+                dk::dkQueueWaitFence(
+                    queue,
+                    ptr::from_ref::<dk::DkFence>(&texture.acquire).cast_mut(),
+                )
+            };
         }
-        fence.value.store(fence_value, Ordering::Release);
+        for cb in command_buffers {
+            // SAFETY: caller orders this against other access to the buffers.
+            unsafe { cb.submit(queue) };
+        }
+        let mut signal = Box::new(dk::DkFence::zeroed());
+        unsafe { dk::dkQueueSignalFence(queue, &mut *signal, true) };
+        fence.pending.lock().push_back((fence_value, signal));
+        if unsafe { dk::dkQueueIsInErrorState(queue) } {
+            return Err(crate::DeviceError::Lost);
+        }
         Ok(())
     }
+
     unsafe fn present(
         &self,
-        surface: &Context,
-        texture: Resource,
+        surface: &Surface,
+        texture: Texture,
     ) -> Result<(), crate::SurfaceError> {
+        let guard = surface.swapchain.lock();
+        let sc = guard.as_ref().ok_or(crate::SurfaceError::Outdated)?;
+        unsafe { self.shared.present(sc.raw, &texture) };
         Ok(())
     }
 
@@ -303,11 +483,12 @@ impl crate::Queue for Context {
     }
 
     unsafe fn wait_for_idle(&self) -> Result<(), crate::DeviceError> {
+        unsafe { self.shared.wait_idle() };
         Ok(())
     }
 }
 
-impl crate::Device for Context {
+impl crate::Device for Device {
     type A = Api;
 
     unsafe fn create_buffer(&self, desc: &crate::BufferDescriptor) -> DeviceResult<Buffer> {
@@ -322,9 +503,6 @@ impl crate::Device for Context {
         buffer: &Buffer,
         range: crate::MemoryRange,
     ) -> DeviceResult<crate::BufferMapping> {
-        // Safety: the `wgpu-core` validation layer will prevent any user-accessible aliasing
-        // mappings from being created, so we don’t need to perform any checks here, except for
-        // bounds checks on the range which are built into `get_slice_ptr()`.
         Ok(crate::BufferMapping {
             ptr: ptr::NonNull::new(buffer.get_slice_ptr(range).cast::<u8>()).unwrap(),
             is_coherent: true,
@@ -334,20 +512,27 @@ impl crate::Device for Context {
     unsafe fn flush_mapped_ranges<I>(&self, buffer: &Buffer, ranges: I) {}
     unsafe fn invalidate_mapped_ranges<I>(&self, buffer: &Buffer, ranges: I) {}
 
-    unsafe fn create_texture(&self, desc: &crate::TextureDescriptor) -> DeviceResult<Resource> {
-        Ok(Resource)
+    unsafe fn create_texture(&self, desc: &crate::TextureDescriptor) -> DeviceResult<Texture> {
+        // K1 gives these a DkImage.
+        Ok(Texture {
+            image: ptr::null(),
+            slot: -1,
+            acquire: dk::DkFence::zeroed(),
+        })
     }
-    unsafe fn destroy_texture(&self, texture: Resource) {}
-    unsafe fn add_raw_texture(&self, _texture: &Resource) {}
+    unsafe fn destroy_texture(&self, texture: Texture) {}
+    unsafe fn add_raw_texture(&self, _texture: &Texture) {}
 
     unsafe fn create_texture_view(
         &self,
-        texture: &Resource,
+        texture: &Texture,
         desc: &crate::TextureViewDescriptor,
-    ) -> DeviceResult<Resource> {
-        Ok(Resource)
+    ) -> DeviceResult<TextureView> {
+        Ok(TextureView {
+            image: texture.image,
+        })
     }
-    unsafe fn destroy_texture_view(&self, view: Resource) {}
+    unsafe fn destroy_texture_view(&self, view: TextureView) {}
     unsafe fn create_sampler(&self, desc: &crate::SamplerDescriptor) -> DeviceResult<Resource> {
         Ok(Resource)
     }
@@ -355,9 +540,9 @@ impl crate::Device for Context {
 
     unsafe fn create_command_encoder(
         &self,
-        desc: &crate::CommandEncoderDescriptor<Context>,
-    ) -> DeviceResult<CommandBuffer> {
-        Ok(CommandBuffer::new())
+        desc: &crate::CommandEncoderDescriptor<Queue>,
+    ) -> DeviceResult<CommandEncoder> {
+        CommandEncoder::new(self.shared.raw)
     }
 
     unsafe fn create_bind_group_layout(
@@ -376,7 +561,7 @@ impl crate::Device for Context {
     unsafe fn destroy_pipeline_layout(&self, pipeline_layout: Resource) {}
     unsafe fn create_bind_group(
         &self,
-        desc: &crate::BindGroupDescriptor<Resource, Buffer, Resource, Resource, Resource>,
+        desc: &crate::BindGroupDescriptor<Resource, Buffer, Resource, TextureView, Resource>,
     ) -> DeviceResult<Resource> {
         Ok(Resource)
     }
@@ -435,12 +620,13 @@ impl crate::Device for Context {
     unsafe fn destroy_query_set(&self, set: Resource) {}
     unsafe fn create_fence(&self) -> DeviceResult<Fence> {
         Ok(Fence {
-            value: AtomicU64::new(0),
+            done: AtomicU64::new(0),
+            pending: Mutex::new(VecDeque::new()),
         })
     }
     unsafe fn destroy_fence(&self, fence: Fence) {}
     unsafe fn get_fence_value(&self, fence: &Fence) -> DeviceResult<crate::FenceValue> {
-        Ok(fence.value.load(Ordering::Acquire))
+        Ok(fence.poll())
     }
     unsafe fn wait(
         &self,
@@ -448,14 +634,27 @@ impl crate::Device for Context {
         value: crate::FenceValue,
         timeout: Option<Duration>,
     ) -> DeviceResult<bool> {
-        // The relevant commands must have already been submitted, and noop-backend commands are
-        // executed synchronously, so there is no waiting — either it is already done,
-        // or this method was called incorrectly.
-        assert!(
-            fence.value.load(Ordering::Acquire) >= value,
-            "submission must have already been done"
-        );
-        Ok(true)
+        if fence.poll() >= value {
+            return Ok(true);
+        }
+        let timeout_ns = timeout.map_or(-1, |t| i64::try_from(t.as_nanos()).unwrap_or(i64::MAX));
+        // ponytail: holds the fence lock while blocked, so pollers on other
+        // threads wait too. Fine with one render thread.
+        let result = {
+            let mut pending = fence.pending.lock();
+            let Some((_, signal)) = pending.iter_mut().find(|(v, _)| *v >= value) else {
+                return Ok(false);
+            };
+            unsafe { dk::dkFenceWait(&mut **signal, timeout_ns) }
+        };
+        match result {
+            dk::DkResult_Success => {
+                fence.poll();
+                Ok(true)
+            }
+            dk::DkResult_Timeout => Ok(false),
+            _ => Err(crate::DeviceError::Lost),
+        }
     }
 
     unsafe fn start_graphics_debugger_capture(&self) -> bool {
