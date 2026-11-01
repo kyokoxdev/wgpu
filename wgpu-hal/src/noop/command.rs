@@ -156,13 +156,13 @@ impl crate::CommandEncoder for CommandBuffer {
 
     unsafe fn set_bind_group(
         &mut self,
-        layout: &Resource,
+        layout: &super::PipelineLayout,
         index: u32,
         group: &Resource,
         dynamic_offsets: &[wgt::DynamicOffset],
     ) {
     }
-    unsafe fn set_immediates(&mut self, layout: &Resource, offset_bytes: u32, data: &[u32]) {}
+    unsafe fn set_immediates(&mut self, layout: &super::PipelineLayout, offset_bytes: u32, data: &[u32]) {}
 
     unsafe fn insert_debug_marker(&mut self, label: &str) {}
     unsafe fn begin_debug_marker(&mut self, group_label: &str) {}

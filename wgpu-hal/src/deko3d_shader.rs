@@ -161,6 +161,124 @@ pub fn translate(
     })
 }
 
+/// A shader module as the hal receives it: the naga IR, translated per
+/// pipeline once the layout is known.
+#[derive(Debug)]
+pub struct ShaderModule {
+    module: alloc::sync::Arc<naga::Module>,
+    info: alloc::sync::Arc<naga::valid::ModuleInfo>,
+}
+
+impl ShaderModule {
+    pub fn new(shader: crate::ShaderInput) -> Result<Self, crate::ShaderError> {
+        match shader {
+            crate::ShaderInput::Naga(naga) => Ok(Self {
+                module: alloc::sync::Arc::new(naga.module.into_owned()),
+                info: alloc::sync::Arc::new(naga.info),
+            }),
+            _ => Err(crate::ShaderError::Compilation(
+                "deko3d: only naga shader input".into(),
+            )),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct BindGroupLayout {
+    entries: alloc::sync::Arc<[wgt::BindGroupLayoutEntry]>,
+}
+
+impl BindGroupLayout {
+    pub fn new(desc: &crate::BindGroupLayoutDescriptor) -> Self {
+        Self {
+            entries: desc.entries.into(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct PipelineLayout {
+    options: glsl::Options,
+}
+
+impl PipelineLayout {
+    pub fn new(
+        desc: &crate::PipelineLayoutDescriptor<BindGroupLayout>,
+    ) -> Result<Self, crate::DeviceError> {
+        let groups: Vec<_> = desc
+            .bind_group_layouts
+            .iter()
+            .map(|bgl| bgl.map(|bgl| &bgl.entries[..]))
+            .collect();
+        let map = binding_map(&groups).map_err(|e| {
+            log::error!("{e}");
+            crate::DeviceError::Unexpected
+        })?;
+        Ok(Self {
+            options: options(map),
+        })
+    }
+}
+
+crate::impl_dyn_resource!(ShaderModule, BindGroupLayout, PipelineLayout);
+impl crate::DynShaderModule for ShaderModule {}
+impl crate::DynBindGroupLayout for BindGroupLayout {}
+impl crate::DynPipelineLayout for PipelineLayout {}
+
+/// The vertex and fragment GLSL of a render pipeline.
+pub fn render_pipeline_glsl<R: crate::DynPipelineCache + ?Sized>(
+    desc: &crate::RenderPipelineDescriptor<PipelineLayout, ShaderModule, R>,
+) -> Result<(Glsl, Option<Glsl>), crate::PipelineError> {
+    let crate::VertexProcessor::Standard { vertex_stage, .. } = &desc.vertex_processor else {
+        return Err(crate::PipelineError::Linkage(
+            wgt::ShaderStages::MESH,
+            "deko3d: no mesh shaders".into(),
+        ));
+    };
+    let stage = |s: &crate::ProgrammableStage<ShaderModule>, naga_stage, wgt_stage| {
+        translate(
+            &s.module.module,
+            &s.module.info,
+            naga_stage,
+            s.entry_point,
+            s.constants,
+            s.zero_initialize_workgroup_memory,
+            &desc.layout.options,
+        )
+        .map_err(|e| crate::PipelineError::Linkage(wgt_stage, e))
+    };
+    let vertex = stage(vertex_stage, naga::ShaderStage::Vertex, wgt::ShaderStages::VERTEX)?;
+    let fragment = desc
+        .fragment_stage
+        .as_ref()
+        .map(|f| stage(f, naga::ShaderStage::Fragment, wgt::ShaderStages::FRAGMENT))
+        .transpose()?;
+    Ok((vertex, fragment))
+}
+
+/// What the Noop backend records under `deko3d-bake`: every render
+/// pipeline's GLSL, for the host bake to compile into packs.
+#[cfg(feature = "deko3d-bake")]
+pub mod record {
+    use alloc::{string::String, vec::Vec};
+
+    #[derive(Debug)]
+    pub struct Recorded {
+        pub label: Option<String>,
+        pub result: Result<(super::Glsl, Option<super::Glsl>), crate::PipelineError>,
+    }
+
+    static RECORDED: std::sync::Mutex<Vec<Recorded>> = std::sync::Mutex::new(Vec::new());
+
+    pub fn push(recorded: Recorded) {
+        RECORDED.lock().unwrap_or_else(|e| e.into_inner()).push(recorded);
+    }
+
+    pub fn take() -> Vec<Recorded> {
+        core::mem::take(&mut *RECORDED.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;

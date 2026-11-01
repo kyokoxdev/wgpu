@@ -15,6 +15,17 @@ pub use buffer::Buffer;
 mod command;
 pub use command::CommandBuffer;
 
+// Under deko3d-bake, Noop keeps the IR and layouts and records every render
+// pipeline's GLSL instead of creating it (`deko3d_shader::record`).
+#[cfg(feature = "deko3d-bake")]
+use crate::deko3d_shader::{BindGroupLayout, PipelineLayout, ShaderModule};
+#[cfg(not(feature = "deko3d-bake"))]
+type BindGroupLayout = Resource;
+#[cfg(not(feature = "deko3d-bake"))]
+type PipelineLayout = Resource;
+#[cfg(not(feature = "deko3d-bake"))]
+type ShaderModule = Resource;
+
 #[derive(Clone, Debug)]
 pub struct Api;
 
@@ -56,10 +67,10 @@ impl crate::Api for Api {
     type AccelerationStructure = Resource;
     type PipelineCache = Resource;
 
-    type BindGroupLayout = Resource;
+    type BindGroupLayout = BindGroupLayout;
     type BindGroup = Resource;
-    type PipelineLayout = Resource;
-    type ShaderModule = Resource;
+    type PipelineLayout = PipelineLayout;
+    type ShaderModule = ShaderModule;
     type RenderPipeline = Resource;
     type RayTracingPipeline = Resource;
     type ComputePipeline = Resource;
@@ -69,17 +80,20 @@ crate::impl_dyn_resource!(Buffer, CommandBuffer, Context, Fence, Resource);
 
 impl crate::DynAccelerationStructure for Resource {}
 impl crate::DynBindGroup for Resource {}
+#[cfg(not(feature = "deko3d-bake"))]
 impl crate::DynBindGroupLayout for Resource {}
 impl crate::DynBuffer for Buffer {}
 impl crate::DynCommandBuffer for CommandBuffer {}
 impl crate::DynComputePipeline for Resource {}
 impl crate::DynFence for Fence {}
 impl crate::DynPipelineCache for Resource {}
+#[cfg(not(feature = "deko3d-bake"))]
 impl crate::DynPipelineLayout for Resource {}
 impl crate::DynQuerySet for Resource {}
 impl crate::DynRenderPipeline for Resource {}
 impl crate::DynRayTracingPipeline for Resource {}
 impl crate::DynSampler for Resource {}
+#[cfg(not(feature = "deko3d-bake"))]
 impl crate::DynShaderModule for Resource {}
 impl crate::DynSurfaceTexture for Resource {}
 impl crate::DynTexture for Resource {}
@@ -354,20 +368,26 @@ impl crate::Device for Context {
     unsafe fn create_bind_group_layout(
         &self,
         desc: &crate::BindGroupLayoutDescriptor,
-    ) -> DeviceResult<Resource> {
+    ) -> DeviceResult<BindGroupLayout> {
+        #[cfg(feature = "deko3d-bake")]
+        return Ok(BindGroupLayout::new(desc));
+        #[cfg(not(feature = "deko3d-bake"))]
         Ok(Resource)
     }
-    unsafe fn destroy_bind_group_layout(&self, bg_layout: Resource) {}
+    unsafe fn destroy_bind_group_layout(&self, bg_layout: BindGroupLayout) {}
     unsafe fn create_pipeline_layout(
         &self,
-        desc: &crate::PipelineLayoutDescriptor<Resource>,
-    ) -> DeviceResult<Resource> {
+        desc: &crate::PipelineLayoutDescriptor<BindGroupLayout>,
+    ) -> DeviceResult<PipelineLayout> {
+        #[cfg(feature = "deko3d-bake")]
+        return PipelineLayout::new(desc);
+        #[cfg(not(feature = "deko3d-bake"))]
         Ok(Resource)
     }
-    unsafe fn destroy_pipeline_layout(&self, pipeline_layout: Resource) {}
+    unsafe fn destroy_pipeline_layout(&self, pipeline_layout: PipelineLayout) {}
     unsafe fn create_bind_group(
         &self,
-        desc: &crate::BindGroupDescriptor<Resource, Buffer, Resource, Resource, Resource>,
+        desc: &crate::BindGroupDescriptor<BindGroupLayout, Buffer, Resource, Resource, Resource>,
     ) -> DeviceResult<Resource> {
         Ok(Resource)
     }
@@ -377,27 +397,35 @@ impl crate::Device for Context {
         &self,
         desc: &crate::ShaderModuleDescriptor,
         shader: crate::ShaderInput,
-    ) -> Result<Resource, crate::ShaderError> {
+    ) -> Result<ShaderModule, crate::ShaderError> {
+        #[cfg(feature = "deko3d-bake")]
+        return ShaderModule::new(shader);
+        #[cfg(not(feature = "deko3d-bake"))]
         Ok(Resource)
     }
-    unsafe fn destroy_shader_module(&self, module: Resource) {}
+    unsafe fn destroy_shader_module(&self, module: ShaderModule) {}
     unsafe fn create_render_pipeline(
         &self,
-        desc: &crate::RenderPipelineDescriptor<Resource, Resource, Resource>,
+        desc: &crate::RenderPipelineDescriptor<PipelineLayout, ShaderModule, Resource>,
     ) -> Result<Resource, crate::PipelineError> {
+        #[cfg(feature = "deko3d-bake")]
+        crate::deko3d_shader::record::push(crate::deko3d_shader::record::Recorded {
+            label: desc.label.map(Into::into),
+            result: crate::deko3d_shader::render_pipeline_glsl(desc),
+        });
         Ok(Resource)
     }
     unsafe fn destroy_render_pipeline(&self, pipeline: Resource) {}
     unsafe fn create_compute_pipeline(
         &self,
-        desc: &crate::ComputePipelineDescriptor<Resource, Resource, Resource>,
+        desc: &crate::ComputePipelineDescriptor<PipelineLayout, ShaderModule, Resource>,
     ) -> Result<Resource, crate::PipelineError> {
         Ok(Resource)
     }
     unsafe fn destroy_compute_pipeline(&self, pipeline: Resource) {}
     unsafe fn create_ray_tracing_pipeline(
         &self,
-        desc: &crate::RayTracingPipelineDescriptor<Resource, Resource, Resource>,
+        desc: &crate::RayTracingPipelineDescriptor<PipelineLayout, ShaderModule, Resource>,
     ) -> Result<Resource, crate::PipelineError> {
         Ok(Resource)
     }
