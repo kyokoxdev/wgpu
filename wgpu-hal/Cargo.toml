@@ -135,7 +135,9 @@ gles = [
     "windows/Win32_UI_WindowsAndMessaging",
 ]
 ## Enables the deko3d backend (Nintendo Switch). Skeleton only for now.
-deko3d = ["dep:deko3d-sys", "dep:parking_lot", "dep:offset-allocator"]
+deko3d = ["deko3d-bake", "dep:deko3d-sys", "dep:parking_lot", "dep:offset-allocator"]
+## Only the deko3d GLSL translation (`deko3d_shader`), for the host shader bake.
+deko3d-bake = ["naga/glsl-out"]
 ## Enables the DX12 backend when targeting Windows.
 dx12 = [
     "dep:arrayvec",

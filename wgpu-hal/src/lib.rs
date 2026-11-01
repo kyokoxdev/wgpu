@@ -250,6 +250,9 @@ extern crate std;
 /// deko3d API internals (Nintendo Switch).
 #[cfg(deko3d)]
 pub mod deko3d;
+/// GLSL translation shared by the deko3d backend and the host shader bake.
+#[cfg(any(deko3d, feature = "deko3d-bake"))]
+pub mod deko3d_shader;
 /// DirectX12 API internals.
 #[cfg(dx12)]
 pub mod dx12;
