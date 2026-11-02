@@ -6,7 +6,7 @@ use core::{ffi::c_void, ptr, time::Duration};
 use deko3d_sys as dk;
 use parking_lot::Mutex;
 
-use super::{Api, Device, Fence, QueueShared, Texture};
+use super::{texture::dk_format, Api, Device, Fence, QueueShared, Texture};
 
 pub struct Surface {
     pub(super) window: *mut c_void,
@@ -27,6 +27,7 @@ pub(super) struct Swapchain {
     pub(super) raw: dk::DkSwapchain,
     queue: Arc<QueueShared>,
     mem: dk::DkMemBlock,
+    format: wgt::TextureFormat,
     /// Boxed: deko3d keeps pointers to these.
     images: Box<[dk::DkImage]>,
 }
@@ -39,14 +40,6 @@ impl Drop for Swapchain {
             dk::dkMemBlockDestroy(self.mem);
         }
     }
-}
-
-pub(super) fn dk_format(format: wgt::TextureFormat) -> Option<dk::DkImageFormat> {
-    Some(match format {
-        wgt::TextureFormat::Rgba8UnormSrgb => dk::DkImageFormat_RGBA8_Unorm_sRGB,
-        wgt::TextureFormat::Rgba8Unorm => dk::DkImageFormat_RGBA8_Unorm,
-        _ => return None,
-    })
 }
 
 const fn align_up(v: u64, a: u64) -> u64 {
@@ -132,6 +125,7 @@ impl crate::Surface for Surface {
             raw,
             queue: Arc::clone(&device.queue),
             mem,
+            format: config.format,
             images,
         });
         Ok(())
@@ -157,11 +151,7 @@ impl crate::Surface for Surface {
             .and_then(|i| sc.images.get(i))
             .ok_or(crate::SurfaceError::Lost)?;
         Ok(crate::AcquiredSurfaceTexture {
-            texture: Texture {
-                image: ptr::from_ref(image),
-                slot,
-                acquire,
-            },
+            texture: Texture::swapchain(ptr::from_ref(image), sc.format, slot, acquire),
             suboptimal: false,
         })
     }

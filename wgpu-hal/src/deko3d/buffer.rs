@@ -49,6 +49,14 @@ impl Buffer {
         Ok(Buffer { mem, cpu, size })
     }
 
+    pub(super) fn size(&self) -> usize {
+        self.size
+    }
+
+    pub(super) fn gpu_addr(&self) -> dk::DkGpuAddr {
+        unsafe { dk::dkMemBlockGetGpuAddr(self.mem.block) + u64::from(self.mem.offset) }
+    }
+
     /// Returns a pointer to the memory owned by this buffer within the given `range`.
     ///
     /// This may be used to create any number of simultaneous pointers;

@@ -40,6 +40,8 @@ struct Block {
 pub(super) struct Pool {
     device: dk::DkDevice,
     flags: u32,
+    /// Bytes kept unused at each block's end.
+    tail: u32,
     blocks: Vec<Block>,
 }
 
@@ -51,8 +53,19 @@ impl Pool {
         Self {
             device,
             flags,
+            tail: 0,
             blocks: Vec::new(),
         }
+    }
+
+    /// A pool for shader code; deko3d can't use the end of a code block.
+    pub fn new_code(device: dk::DkDevice) -> Self {
+        let mut pool = Self::new(
+            device,
+            dk::DkMemBlockFlags_CpuUncached | dk::DkMemBlockFlags_GpuCached | dk::DkMemBlockFlags_Code,
+        );
+        pool.tail = dk::DK_SHADER_CODE_UNUSABLE_SIZE;
+        pool
     }
 
     fn create_block(&self, size: u32) -> Option<dk::DkMemBlock> {
@@ -65,7 +78,9 @@ impl Pool {
     pub fn alloc(&mut self, size: u64, align: u32) -> Option<Allocation> {
         let size = u32::try_from(size.max(1)).ok()?;
         if size > BLOCK_SIZE / 2 {
-            let block_size = size.checked_next_multiple_of(dk::DK_MEMBLOCK_ALIGNMENT)?;
+            let block_size = size
+                .checked_add(self.tail)?
+                .checked_next_multiple_of(dk::DK_MEMBLOCK_ALIGNMENT)?;
             return Some(Allocation {
                 block: self.create_block(block_size)?,
                 offset: 0,
@@ -81,7 +96,7 @@ impl Pool {
         // shows pools only grow.
         let mut b = Block {
             raw: self.create_block(BLOCK_SIZE)?,
-            alloc: Allocator::new(BLOCK_SIZE),
+            alloc: Allocator::new(BLOCK_SIZE - self.tail),
         };
         let (offset, raw) = alloc_aligned(&mut b.alloc, size, align)?;
         let block = b.raw;

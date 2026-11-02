@@ -1,8 +1,9 @@
 //! deko3d backend (Nintendo Switch).
 //!
-//! S4 state: real device, queue, fences and swapchain; render passes bind
-//! and clear swapchain images. Buffers live in pooled GPU memory (CPU-visible), other textures
-//! have no image, and pipelines/draws are recorded as nothing (K1-K3).
+//! Buffers live in pooled CPU-visible memory and textures in pooled image
+//! memory, with views and samplers in device descriptor sets. Pipelines come
+//! from prebaked DKSH packs and draws record straight into command lists.
+//! Not yet (F1): compute, queries, MSAA.
 
 #![allow(unused_variables)]
 
@@ -22,15 +23,22 @@ use portable_atomic::AtomicU64;
 use deko3d_sys as dk;
 use parking_lot::Mutex;
 
-use crate::TlasInstance;
+use crate::{
+    deko3d_shader::{BindGroupLayout, PipelineLayout, ShaderModule},
+    TlasInstance,
+};
 
 mod buffer;
 pub use buffer::Buffer;
 mod command;
 mod memory;
+mod pipeline;
+pub use pipeline::{BindGroup, RenderPipeline};
 pub use command::{CommandBuffer, CommandEncoder};
 mod surface;
 pub use surface::Surface;
+mod texture;
+pub use texture::{Sampler, Texture, TextureView};
 
 #[derive(Clone, Debug)]
 pub struct Api;
@@ -87,6 +95,10 @@ pub struct Adapter {
 pub struct Device {
     /// CPU-uncached, GPU-cached; declared first so it drops before the device.
     buffers: Mutex<memory::Pool>,
+    /// GPU-only image memory.
+    images: Mutex<memory::Pool>,
+    descriptors: Mutex<texture::DescriptorSets>,
+    shaders: Mutex<pipeline::ShaderCache>,
     shared: Arc<DeviceShared>,
     queue: Arc<QueueShared>,
 }
@@ -108,26 +120,8 @@ opaque_debug!(
     Adapter,
     Device,
     Queue,
-    Texture,
-    TextureView,
     Fence
 );
-
-/// A texture. Only swapchain images have a `DkImage` so far (`image` is null
-/// otherwise); `slot`/`acquire` are meaningful only for those.
-pub struct Texture {
-    image: *const dk::DkImage,
-    slot: i32,
-    acquire: dk::DkFence,
-}
-unsafe impl Send for Texture {}
-unsafe impl Sync for Texture {}
-
-pub struct TextureView {
-    image: *const dk::DkImage,
-}
-unsafe impl Send for TextureView {}
-unsafe impl Sync for TextureView {}
 
 #[derive(Debug)]
 pub struct Resource;
@@ -172,23 +166,24 @@ impl crate::Api for Api {
     type Texture = Texture;
     type SurfaceTexture = Texture;
     type TextureView = TextureView;
-    type Sampler = Resource;
+    type Sampler = Sampler;
     type QuerySet = Resource;
     type Fence = Fence;
     type AccelerationStructure = Resource;
     type PipelineCache = Resource;
 
-    type BindGroupLayout = Resource;
-    type BindGroup = Resource;
-    type PipelineLayout = Resource;
-    type ShaderModule = Resource;
-    type RenderPipeline = Resource;
+    type BindGroupLayout = BindGroupLayout;
+    type BindGroup = BindGroup;
+    type PipelineLayout = PipelineLayout;
+    type ShaderModule = ShaderModule;
+    type RenderPipeline = RenderPipeline;
     type RayTracingPipeline = Resource;
     type ComputePipeline = Resource;
 }
 
 crate::impl_dyn_resource!(
     Adapter,
+    BindGroup,
     Buffer,
     CommandBuffer,
     CommandEncoder,
@@ -196,26 +191,25 @@ crate::impl_dyn_resource!(
     Fence,
     Instance,
     Queue,
+    RenderPipeline,
     Resource,
+    Sampler,
     Surface,
     Texture,
     TextureView
 );
 
 impl crate::DynAccelerationStructure for Resource {}
-impl crate::DynBindGroup for Resource {}
-impl crate::DynBindGroupLayout for Resource {}
+impl crate::DynBindGroup for BindGroup {}
 impl crate::DynBuffer for Buffer {}
 impl crate::DynCommandBuffer for CommandBuffer {}
 impl crate::DynComputePipeline for Resource {}
 impl crate::DynFence for Fence {}
 impl crate::DynPipelineCache for Resource {}
-impl crate::DynPipelineLayout for Resource {}
 impl crate::DynQuerySet for Resource {}
-impl crate::DynRenderPipeline for Resource {}
+impl crate::DynRenderPipeline for RenderPipeline {}
 impl crate::DynRayTracingPipeline for Resource {}
-impl crate::DynSampler for Resource {}
-impl crate::DynShaderModule for Resource {}
+impl crate::DynSampler for Sampler {}
 impl crate::DynSurfaceTexture for Texture {}
 impl crate::DynTexture for Texture {}
 impl crate::DynTextureView for TextureView {}
@@ -370,12 +364,20 @@ impl crate::Adapter for Adapter {
             raw: Mutex::new(raw),
             _device: Arc::clone(&self.shared),
         });
+        let descriptors =
+            texture::DescriptorSets::new(self.shared.raw).ok_or(crate::DeviceError::OutOfMemory)?;
         Ok(crate::OpenDevice {
             device: Device {
                 buffers: Mutex::new(memory::Pool::new(
                     self.shared.raw,
                     dk::DkMemBlockFlags_CpuUncached | dk::DkMemBlockFlags_GpuCached,
                 )),
+                images: Mutex::new(memory::Pool::new(
+                    self.shared.raw,
+                    dk::DkMemBlockFlags_GpuCached | dk::DkMemBlockFlags_Image,
+                )),
+                descriptors: Mutex::new(descriptors),
+                shaders: Mutex::new(pipeline::ShaderCache::new(self.shared.raw)),
                 shared: Arc::clone(&self.shared),
                 queue: Arc::clone(&queue),
             },
@@ -530,14 +532,13 @@ impl crate::Device for Device {
     unsafe fn invalidate_mapped_ranges<I>(&self, buffer: &Buffer, ranges: I) {}
 
     unsafe fn create_texture(&self, desc: &crate::TextureDescriptor) -> DeviceResult<Texture> {
-        // K1 gives these a DkImage.
-        Ok(Texture {
-            image: ptr::null(),
-            slot: -1,
-            acquire: dk::DkFence::zeroed(),
-        })
+        Texture::new(self.shared.raw, &mut self.images.lock(), desc)
     }
-    unsafe fn destroy_texture(&self, texture: Texture) {}
+    unsafe fn destroy_texture(&self, texture: Texture) {
+        if let Some(mem) = texture.into_mem() {
+            self.images.lock().free(mem);
+        }
+    }
     unsafe fn add_raw_texture(&self, _texture: &Texture) {}
 
     unsafe fn create_texture_view(
@@ -545,70 +546,76 @@ impl crate::Device for Device {
         texture: &Texture,
         desc: &crate::TextureViewDescriptor,
     ) -> DeviceResult<TextureView> {
-        Ok(TextureView {
-            image: texture.image,
-        })
+        TextureView::new(texture, desc, &mut self.descriptors.lock())
     }
-    unsafe fn destroy_texture_view(&self, view: TextureView) {}
-    unsafe fn create_sampler(&self, desc: &crate::SamplerDescriptor) -> DeviceResult<Resource> {
-        Ok(Resource)
+    unsafe fn destroy_texture_view(&self, view: TextureView) {
+        if let Some(slot) = view.descriptor {
+            self.descriptors.lock().free_image(slot);
+        }
     }
-    unsafe fn destroy_sampler(&self, sampler: Resource) {}
+    unsafe fn create_sampler(&self, desc: &crate::SamplerDescriptor) -> DeviceResult<Sampler> {
+        Sampler::new(desc, &mut self.descriptors.lock())
+    }
+    unsafe fn destroy_sampler(&self, sampler: Sampler) {
+        self.descriptors.lock().free_sampler(sampler.descriptor);
+    }
 
     unsafe fn create_command_encoder(
         &self,
         desc: &crate::CommandEncoderDescriptor<Queue>,
     ) -> DeviceResult<CommandEncoder> {
-        CommandEncoder::new(self.shared.raw)
+        CommandEncoder::new(self.shared.raw, self.descriptors.lock().sets())
     }
 
     unsafe fn create_bind_group_layout(
         &self,
         desc: &crate::BindGroupLayoutDescriptor,
-    ) -> DeviceResult<Resource> {
-        Ok(Resource)
+    ) -> DeviceResult<BindGroupLayout> {
+        Ok(BindGroupLayout::new(desc))
     }
-    unsafe fn destroy_bind_group_layout(&self, bg_layout: Resource) {}
+    unsafe fn destroy_bind_group_layout(&self, bg_layout: BindGroupLayout) {}
     unsafe fn create_pipeline_layout(
         &self,
-        desc: &crate::PipelineLayoutDescriptor<Resource>,
-    ) -> DeviceResult<Resource> {
-        Ok(Resource)
+        desc: &crate::PipelineLayoutDescriptor<BindGroupLayout>,
+    ) -> DeviceResult<PipelineLayout> {
+        PipelineLayout::new(desc)
     }
-    unsafe fn destroy_pipeline_layout(&self, pipeline_layout: Resource) {}
+    unsafe fn destroy_pipeline_layout(&self, pipeline_layout: PipelineLayout) {}
     unsafe fn create_bind_group(
         &self,
-        desc: &crate::BindGroupDescriptor<Resource, Buffer, Resource, TextureView, Resource>,
-    ) -> DeviceResult<Resource> {
-        Ok(Resource)
+        desc: &crate::BindGroupDescriptor<BindGroupLayout, Buffer, Sampler, TextureView, Resource>,
+    ) -> DeviceResult<BindGroup> {
+        BindGroup::new(desc)
     }
-    unsafe fn destroy_bind_group(&self, group: Resource) {}
+    unsafe fn destroy_bind_group(&self, group: BindGroup) {}
 
     unsafe fn create_shader_module(
         &self,
         desc: &crate::ShaderModuleDescriptor,
         shader: crate::ShaderInput,
-    ) -> Result<Resource, crate::ShaderError> {
-        Ok(Resource)
+    ) -> Result<ShaderModule, crate::ShaderError> {
+        ShaderModule::new(shader)
     }
-    unsafe fn destroy_shader_module(&self, module: Resource) {}
+    unsafe fn destroy_shader_module(&self, module: ShaderModule) {}
     unsafe fn create_render_pipeline(
         &self,
-        desc: &crate::RenderPipelineDescriptor<Resource, Resource, Resource>,
-    ) -> Result<Resource, crate::PipelineError> {
-        Ok(Resource)
+        desc: &crate::RenderPipelineDescriptor<PipelineLayout, ShaderModule, Resource>,
+    ) -> Result<RenderPipeline, crate::PipelineError> {
+        RenderPipeline::new(&mut self.shaders.lock(), desc)
     }
-    unsafe fn destroy_render_pipeline(&self, pipeline: Resource) {}
+    unsafe fn destroy_render_pipeline(&self, pipeline: RenderPipeline) {
+        pipeline.destroy(&mut self.shaders.lock());
+    }
     unsafe fn create_compute_pipeline(
         &self,
-        desc: &crate::ComputePipelineDescriptor<Resource, Resource, Resource>,
+        desc: &crate::ComputePipelineDescriptor<PipelineLayout, ShaderModule, Resource>,
     ) -> Result<Resource, crate::PipelineError> {
         Ok(Resource)
     }
     unsafe fn destroy_compute_pipeline(&self, pipeline: Resource) {}
     unsafe fn create_ray_tracing_pipeline(
         &self,
-        desc: &crate::RayTracingPipelineDescriptor<Resource, Resource, Resource>,
+        desc: &crate::RayTracingPipelineDescriptor<PipelineLayout, ShaderModule, Resource>,
     ) -> Result<Resource, crate::PipelineError> {
         Ok(Resource)
     }
